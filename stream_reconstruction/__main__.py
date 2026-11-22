@@ -49,12 +49,16 @@ def main():
                         help="选择原始位姿、历史锚，或历史锚加起始三帧")
     parser.add_argument("--pose-solver", choices=("single", "joint"), default="single",
                         help="选择单参考半步融合或多参考联合求解")
+    parser.add_argument("--summary", choices=("off", "recent", "full"), default="off",
+                        help="联合求解读取三个近期或全历史的方向摘要")
     args = parser.parse_args()
     config = SelectionConfig(lookahead=args.lookahead, capacity=args.capacity, min_gap=args.min_gap)
     if args.revise_depth and args.lookahead != 4:
         parser.error("四步深度融合需要 --lookahead 4")
     if args.pose_mode == "baseline" and args.pose_solver == "joint":
         parser.error("联合求解需要 --pose-mode anchors 或 fixed")
+    if args.summary != "off" and (args.pose_mode != "fixed" or args.pose_solver != "joint"):
+        parser.error("方向摘要需要 --pose-mode fixed --pose-solver joint")
     paths = input_paths(args.source)
     from abot_recon import ABotRecon
 
@@ -65,7 +69,7 @@ def main():
     log = args.output / "decisions.jsonl.part"
     trajectory = args.output / "trajectory.jsonl.part"
     steps = reconstruct(wrapper.model.network.eval(), paths, config, revise_depth=args.revise_depth,
-                        pose_mode=args.pose_mode, pose_solver=args.pose_solver)
+                        pose_mode=args.pose_mode, pose_solver=args.pose_solver, summary=args.summary)
     with (closing(steps), log.open("x", encoding="utf-8") as stream,
           trajectory.open("x", encoding="utf-8") as poses):
         for step in steps:
@@ -73,7 +77,7 @@ def main():
                 raw = step.prediction["camera_poses"][0, 0].detach().float().cpu().tolist()
                 entry = dict(index=step.index, image=paths[step.index].name, raw=raw,
                              pose=step.published_pose.tolist(), mode=args.pose_mode,
-                             solver=args.pose_solver,
+                             solver=args.pose_solver, summary=args.summary,
                              **step.pose_evidence)
                 poses.write(json.dumps(entry, ensure_ascii=False, allow_nan=False) + "\n")
             if step.decision is None:

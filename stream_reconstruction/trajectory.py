@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from .directions import BLOCK_FRAMES, DIRECTION_SIGMA, DirectionMemory
 from .selection import Observation, mutual_matches
 
 
@@ -82,8 +83,8 @@ def estimate_pose(current, reference, matcher, prior):
     return None if evidence is None else half_step(prior, evidence)
 
 
-def joint_step(prior, current, matches):
-    """用归一化像面重投影与位姿先验求一次稳健高斯–牛顿增量。"""
+def ray_terms(current, matches):
+    """构造按不同当前特征归一化的重投影线性系统。"""
     if len(matches) < 2:
         return None
     queries = np.concatenate([match.query for match in matches])
@@ -106,38 +107,71 @@ def joint_step(prior, current, matches):
     singular = np.linalg.svd(system, compute_uv=False)
     if singular[-1] <= 1e-3 * singular[0]:
         return None
+    return len(unique), scale, points, observed, weights, system, residual.ravel() * robust
+
+
+def ray_cost(points, observed, weights):
+    if np.any(points[:, 2] <= 0):
+        return np.inf
+    error = np.linalg.norm((points[:, :2] / points[:, 2:] - observed) / RAY_SIGMA, axis=1)
+    return weights @ np.where(error <= 1, error**2, 2 * error - 1)
+
+
+def joint_step(prior, current, matches, directions=()):
+    """合并点重投影、旋转方向与局部先验，求一次高斯–牛顿增量。"""
+    rays = ray_terms(current, matches)
+    if rays is None and not directions:
+        return None
     regularizer = np.diag([1 / np.deg2rad(2)] * 3 + [1 / 0.02] * 3)
-    delta = np.linalg.lstsq(
-        np.vstack((system, regularizer)),
-        -np.concatenate((residual.ravel() * robust, np.zeros(6))), rcond=None)[0]
+    systems = [regularizer]
+    residuals = [np.zeros(6)]
+    if rays is not None:
+        count, scale, points, observed, weights, system, residual = rays
+        systems.insert(0, system)
+        residuals.insert(0, residual)
+    else:
+        count, scale = 0, 1.
+    if directions:
+        source = np.stack([match.prior_axis for match in directions])
+        target = np.stack([match.local_axis for match in directions])
+        support = np.array([match.support for match in directions])
+        weight = np.sqrt(np.minimum(support / 3, 1) / len(directions))[:, None]
+        weight /= DIRECTION_SIGMA
+        rotation_jacobian = np.cross(np.eye(3)[None], source[:, None]).transpose(0, 2, 1)
+        system = np.zeros((3 * len(directions), 6))
+        system[:, :3] = (rotation_jacobian * weight[:, :, None]).reshape(-1, 3)
+        systems.append(system)
+        residuals.append(((source - target) * weight).ravel())
+
+    delta = np.linalg.lstsq(np.vstack(systems), -np.concatenate(residuals), rcond=None)[0]
     if np.linalg.norm(delta[:3]) > MAX_ROTATION or np.linalg.norm(delta[3:]) > MAX_TRANSLATION:
         return None
-
     rotation = cv2.Rodrigues(delta[:3])[0]
-    adjusted = points @ rotation.T + delta[3:]
-    if np.any(adjusted[:, 2] <= 0):
-        return None
-    trial_error = np.linalg.norm((adjusted[:, :2] / adjusted[:, 2:] - observed) / RAY_SIGMA,
-                                 axis=1)
-
-    def huber(values):
-        return weights @ np.where(values <= 1, values**2, 2 * values - 1)
-
-    if huber(trial_error) + np.linalg.norm(regularizer @ delta)**2 >= huber(error):
+    initial, trial = 0., np.linalg.norm(regularizer @ delta)**2
+    if rays is not None:
+        initial += ray_cost(points, observed, weights)
+        trial += ray_cost(points @ rotation.T + delta[3:], observed, weights)
+    if directions:
+        initial += np.linalg.norm((source - target) * weight)**2
+        trial += np.linalg.norm((source @ rotation.T - target) * weight)**2
+    if trial >= initial:
         return None
     # 优化增量从先验相机系映射到当前相机系，发布位姿需要其逆。
     correction = np.eye(4)
     correction[:3, :3] = rotation.T
     correction[:3, 3] = -scale * (rotation.T @ delta[3:])
-    return len(unique), prior @ correction
+    return count, prior @ correction
 
 
 class PoseMemory:
-    def __init__(self, mode, capacity, window, solver="single"):
+    def __init__(self, mode, capacity, window, solver="single", summary="off"):
         if mode not in ('anchors', 'fixed') or window < 1:
             raise ValueError('需要有效的记忆模式和正的近期窗口')
         if solver not in ('single', 'joint'):
             raise ValueError('位姿求解器须为单参考或联合求解')
+        if summary != 'off' and (mode != 'fixed' or solver != 'joint'):
+            raise ValueError('方向摘要需要固定帧和联合求解模式')
+        self.directions = None if summary == 'off' else DirectionMemory(summary)
         self.mode = mode
         self.solver = solver
         self.window = window
@@ -147,7 +181,7 @@ class PoseMemory:
         self.previous_raw = self.previous_pose = None
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
 
-    def advance(self, frame, raw, decision):
+    def advance(self, frame, raw, decision, axes=()):
         prior = raw.astype(np.float64)
         if self.previous_pose is not None:
             prior = self.previous_pose @ np.linalg.solve(self.previous_raw, prior)
@@ -165,11 +199,18 @@ class PoseMemory:
             if evidence is not None:
                 matches.append(evidence)
         pose, count, used = prior, 0, []
+        directions = [] if self.directions is None else self.directions.read(axes, prior[:3, :3])
+        used_directions = []
         if self.solver == 'joint':
-            result = joint_step(prior, frame, matches)
+            result = joint_step(prior, frame, matches, directions)
+            if result is None and directions and len(matches) >= 2:
+                result = joint_step(prior, frame, matches)
+                directions = []
             if result is not None:
                 count, pose = result
-                used = [match.reference for match in matches]
+                if count:
+                    used = [match.reference for match in matches]
+                used_directions = directions
         elif matches:
             best = max(matches, key=lambda match: len(match.query))
             count, pose = half_step(prior, best)
@@ -185,7 +226,20 @@ class PoseMemory:
                 self.history.append(resolved)
         self.previous_raw = raw.astype(np.float64)
         self.previous_pose = pose.copy()
-        return pose, dict(candidates=[r.observation.index for r in candidates],
-                          reference=used[0] if len(used) == 1 else None,
-                          references=used, verified=[match.reference for match in matches],
-                          inliers=count)
+        log = dict(candidates=[r.observation.index for r in candidates],
+                   reference=used[0] if len(used) == 1 else None,
+                   references=used, verified=[match.reference for match in matches],
+                   inliers=count)
+        if self.directions is not None:
+            block = frame.index // BLOCK_FRAMES
+            earlier = [match for match in matches if match.reference // BLOCK_FRAMES < block]
+            alignment = prior[:3, :3] if block == 0 else None
+            if earlier:
+                best = max(earlier, key=lambda match: len(match.query))
+                alignment = prior[:3, :3] @ best.relative[:3, :3]
+            log['directions'] = [dict(slot=match.slot, support=match.support, scatter=match.scatter)
+                                 for match in used_directions]
+            self.directions.after_publish(frame.index, axes, alignment)
+            log['summary_commit'] = self.directions.committed
+            log['summary_submaps'] = len(self.directions.contributions)
+        return pose, log

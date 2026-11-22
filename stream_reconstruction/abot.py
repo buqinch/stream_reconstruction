@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from .directions import plane_axes
 from .trajectory import PoseMemory
 from .fusion import DELAY, Frame, revise
 from .selection import AnchorSelector, Decision, SelectionConfig, observe
@@ -40,7 +41,7 @@ def motion_keyframes(paths, tracker, threshold=50):
 
 
 def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
-                pose_mode="baseline", pose_solver="single"):
+                pose_mode="baseline", pose_solver="single", summary="off"):
     """逐帧返回原模型预测及到期决定，首版预测由调用方按需消费。"""
     import torch
     from abot_recon.modeling.streaming.core.cache_utils import detach_carry
@@ -49,10 +50,12 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
         raise ValueError("既有深度融合需要四个后续输入")
     if pose_mode == "baseline" and pose_solver != "single":
         raise ValueError("联合求解需要历史锚或固定帧模式")
+    if pose_mode == "baseline" and summary != "off":
+        raise ValueError("方向摘要需要固定帧和联合求解模式")
     device = next(network.parameters()).device
     selector = AnchorSelector(config)
     memory = None if pose_mode == "baseline" else PoseMemory(
-        pose_mode, config.capacity, network.local_window_frames, solver=pose_solver)
+        pose_mode, config.capacity, network.local_window_frames, solver=pose_solver, summary=summary)
     detector = cv2.ORB_create(nfeatures=192)
     geometry = deque(maxlen=DELAY + 1)
     carry = reference = camera_state = descriptor = None
@@ -104,7 +107,12 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
             decision = selector.push(observation)
             published, evidence = pose, {}
             if memory is not None:
-                published, evidence = memory.advance(observation, pose, decision)
+                axes = ()
+                if summary != "off":
+                    grid = points[::8, ::8].float().cpu().numpy()
+                    scores = confidence[::8, ::8].float().sigmoid().cpu().numpy()
+                    axes = plane_axes(grid, scores, max(0.25, config.min_confidence))
+                published, evidence = memory.advance(observation, pose, decision, axes)
             corrected = None
             if revise_depth:
                 geometry.append(Frame(
