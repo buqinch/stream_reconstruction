@@ -2,6 +2,7 @@
 
 from collections import deque
 from dataclasses import dataclass
+from itertools import combinations
 
 import cv2
 import numpy as np
@@ -27,6 +28,7 @@ class PoseEvidence:
 MAX_ROTATION = np.deg2rad(5)
 MAX_TRANSLATION = 0.05
 RAY_SIGMA = 0.012
+SUMMARY_ROTATION_TOLERANCE = np.deg2rad(2)
 
 
 def pose_evidence(current, reference, matcher, prior):
@@ -117,7 +119,7 @@ def ray_cost(points, observed, weights):
     return weights @ np.where(error <= 1, error**2, 2 * error - 1)
 
 
-def joint_step(prior, current, matches, directions=()):
+def joint_step(prior, current, matches, directions=(), *, direction_gain=1.):
     """合并点重投影、旋转方向与局部先验，求一次高斯–牛顿增量。"""
     rays = ray_terms(current, matches)
     if rays is None and not directions:
@@ -135,7 +137,7 @@ def joint_step(prior, current, matches, directions=()):
         source = np.stack([match.prior_axis for match in directions])
         target = np.stack([match.local_axis for match in directions])
         support = np.array([match.support for match in directions])
-        weight = np.sqrt(np.minimum(support / 3, 1) / len(directions))[:, None]
+        weight = np.sqrt(direction_gain * np.minimum(support / 3, 1) / len(directions))[:, None]
         weight /= DIRECTION_SIGMA
         rotation_jacobian = np.cross(np.eye(3)[None], source[:, None]).transpose(0, 2, 1)
         system = np.zeros((3 * len(directions), 6))
@@ -163,15 +165,54 @@ def joint_step(prior, current, matches, directions=()):
     return count, prior @ correction
 
 
+def summary_alignment(frame, prior, matches, method):
+    """将子图写入旋转限定在通过 PnP 检查的较早子图参考上。"""
+    block = frame // BLOCK_FRAMES
+    rotation = prior[:3, :3]
+    if block == 0:
+        return rotation
+    earlier = [match for match in matches if match.reference // BLOCK_FRAMES < block]
+    if not earlier:
+        return None
+    if method == 'single':
+        best = max(earlier, key=lambda match: len(match.query))
+        return rotation @ best.relative[:3, :3]
+
+    # 在共同的先验相机系中选择成对角度相容的参考。各增量已被限定在 5° 内。
+    rotations = [match.relative[:3, :3] for match in earlier]
+    support = np.array([len(match.query) for match in earlier])
+    blocks = [match.reference // BLOCK_FRAMES for match in earlier]
+    chosen, best_support = None, 0
+    for left, right in combinations(range(len(earlier)), 2):
+        if blocks[left] == blocks[right]:
+            continue
+        angle = np.linalg.norm(cv2.Rodrigues(rotations[left].T @ rotations[right])[0])
+        pair_support = min(support[left], support[right])
+        if angle <= SUMMARY_ROTATION_TOLERANCE and pair_support > best_support:
+            chosen, best_support = [left, right], pair_support
+    if chosen is None:
+        return None
+    increments = np.stack([cv2.Rodrigues(rotations[i])[0].ravel() for i in chosen])
+    consensus = np.average(increments, axis=0, weights=support[chosen])
+    return rotation @ cv2.Rodrigues(consensus)[0]
+
+
 class PoseMemory:
-    def __init__(self, mode, capacity, window, solver="single", summary="off"):
+    def __init__(self, mode, capacity, window, solver="single", summary="off", *,
+                 direction_gain=1., alignment="single"):
         if mode not in ('anchors', 'fixed') or window < 1:
             raise ValueError('需要有效的记忆模式和正的近期窗口')
         if solver not in ('single', 'joint'):
             raise ValueError('位姿求解器须为单参考或联合求解')
         if summary != 'off' and (mode != 'fixed' or solver != 'joint'):
             raise ValueError('方向摘要需要固定帧和联合求解模式')
+        if not 0 <= direction_gain <= 1:
+            raise ValueError('方向能量权重须在 [0, 1] 内')
+        if alignment not in ('single', 'consensus'):
+            raise ValueError('摘要写入须选择单参考或跨子图共识')
         self.directions = None if summary == 'off' else DirectionMemory(summary)
+        self.direction_gain = direction_gain
+        self.alignment = alignment
         self.mode = mode
         self.solver = solver
         self.window = window
@@ -199,10 +240,12 @@ class PoseMemory:
             if evidence is not None:
                 matches.append(evidence)
         pose, count, used = prior, 0, []
-        directions = [] if self.directions is None else self.directions.read(axes, prior[:3, :3])
+        directions = []
+        if self.directions is not None and self.direction_gain:
+            directions = self.directions.read(axes, prior[:3, :3])
         used_directions = []
         if self.solver == 'joint':
-            result = joint_step(prior, frame, matches, directions)
+            result = joint_step(prior, frame, matches, directions, direction_gain=self.direction_gain)
             if result is None and directions and len(matches) >= 2:
                 result = joint_step(prior, frame, matches)
                 directions = []
@@ -231,12 +274,7 @@ class PoseMemory:
                    references=used, verified=[match.reference for match in matches],
                    inliers=count)
         if self.directions is not None:
-            block = frame.index // BLOCK_FRAMES
-            earlier = [match for match in matches if match.reference // BLOCK_FRAMES < block]
-            alignment = prior[:3, :3] if block == 0 else None
-            if earlier:
-                best = max(earlier, key=lambda match: len(match.query))
-                alignment = prior[:3, :3] @ best.relative[:3, :3]
+            alignment = summary_alignment(frame.index, prior, matches, self.alignment)
             log['directions'] = [dict(slot=match.slot, support=match.support, scatter=match.scatter)
                                  for match in used_directions]
             self.directions.after_publish(frame.index, axes, alignment)
