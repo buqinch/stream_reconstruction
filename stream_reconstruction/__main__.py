@@ -45,6 +45,8 @@ def main():
     parser.add_argument("--capacity", type=int, default=8, help="长期锚帧槽位数")
     parser.add_argument("--min-gap", type=int, default=1, help="两个已接纳锚之间的最小输入间隔")
     parser.add_argument("--revise-depth", action="store_true", help="保存四步几何融合后的锚帧深度")
+    parser.add_argument("--pose-mode", choices=("baseline", "anchors", "fixed"), default="baseline",
+                        help="选择原始位姿、历史锚，或历史锚加起始三帧")
     args = parser.parse_args()
     config = SelectionConfig(lookahead=args.lookahead, capacity=args.capacity, min_gap=args.min_gap)
     if args.revise_depth and args.lookahead != 4:
@@ -57,9 +59,18 @@ def main():
         attention_backend="sdpa", loop_closure=False)
     args.output.mkdir(parents=True, exist_ok=False)
     log = args.output / "decisions.jsonl.part"
-    steps = reconstruct(wrapper.model.network.eval(), paths, config, revise_depth=args.revise_depth)
-    with closing(steps), log.open("x", encoding="utf-8") as stream:
+    trajectory = args.output / "trajectory.jsonl.part"
+    steps = reconstruct(wrapper.model.network.eval(), paths, config, revise_depth=args.revise_depth,
+                        pose_mode=args.pose_mode)
+    with (closing(steps), log.open("x", encoding="utf-8") as stream,
+          trajectory.open("x", encoding="utf-8") as poses):
         for step in steps:
+            if step.prediction is not None:
+                raw = step.prediction["camera_poses"][0, 0].detach().float().cpu().tolist()
+                entry = dict(index=step.index, image=paths[step.index].name, raw=raw,
+                             pose=step.published_pose.tolist(), mode=args.pose_mode,
+                             **step.pose_evidence)
+                poses.write(json.dumps(entry, ensure_ascii=False, allow_nan=False) + "\n")
             if step.decision is None:
                 continue
             decision = step.decision
@@ -67,6 +78,7 @@ def main():
                 np.save(args.output / f"depth_{decision.candidate:06d}.npy", step.revised_depth)
             record = dict(**asdict(decision), image=paths[decision.candidate].name)
             stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+    trajectory.rename(args.output / "trajectory.jsonl")
     log.rename(args.output / "decisions.jsonl")
 
 

@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from .trajectory import PoseMemory
 from .fusion import DELAY, Frame, revise
 from .selection import AnchorSelector, Decision, SelectionConfig, observe
 
@@ -17,6 +18,8 @@ class StreamStep:
     prediction: dict | None = None
     decision: Decision | None = None
     revised_depth: np.ndarray | None = None
+    published_pose: np.ndarray | None = None
+    pose_evidence: dict | None = None
 
 
 def _input_image(path):
@@ -36,7 +39,7 @@ def motion_keyframes(paths, tracker, threshold=50):
             yield index
 
 
-def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False):
+def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False, pose_mode="baseline"):
     """逐帧返回原模型预测及到期决定，首版预测由调用方按需消费。"""
     import torch
     from abot_recon.modeling.streaming.core.cache_utils import detach_carry
@@ -45,6 +48,8 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False)
         raise ValueError("既有深度融合需要四个后续输入")
     device = next(network.parameters()).device
     selector = AnchorSelector(config)
+    memory = None if pose_mode == "baseline" else PoseMemory(
+        pose_mode, config.capacity, network.local_window_frames)
     detector = cv2.ORB_create(nfeatures=192)
     geometry = deque(maxlen=DELAY + 1)
     carry = reference = camera_state = descriptor = None
@@ -90,9 +95,13 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False)
                 weights = confidence[rows, cols].float().sigmoid().cpu().numpy()
                 return values, weights
 
-            decision = selector.push(observe(
+            observation = observe(
                 index, descriptor.cpu().numpy(), gray, pose, detector, sample_geometry,
-                config.min_confidence))
+                config.min_confidence)
+            decision = selector.push(observation)
+            published, evidence = pose, {}
+            if memory is not None:
+                published, evidence = memory.advance(observation, pose, decision)
             corrected = None
             if revise_depth:
                 geometry.append(Frame(
@@ -100,7 +109,7 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False)
                     confidence[::4, ::4].float().sigmoid().cpu().numpy(), pose))
                 if decision is not None and decision.kept:
                     corrected, _ = revise(list(geometry))
-            yield StreamStep(index, prediction, decision, corrected)
+            yield StreamStep(index, prediction, decision, corrected, published, evidence)
         for decision in selector.finish():
             yield StreamStep(decision.decided_at, decision=decision)
     finally:

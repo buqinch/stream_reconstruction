@@ -38,6 +38,8 @@ class Observation:
     features: np.ndarray
     rays: np.ndarray
 
+    local_points: np.ndarray | None = None
+
     @property
     def quality(self):
         return len(np.unique(self.cells)) / 24
@@ -56,7 +58,8 @@ def observe(index, descriptor, gray, pose, detector, sample_geometry, min_confid
     keypoints, features = detector.detectAndCompute(gray, None)
     if features is None:
         return Observation(index, descriptor / norm, np.empty(0, np.int32),
-                           np.empty((0, 32), np.uint8), np.empty((0, 3), np.float32))
+                           np.empty((0, 32), np.uint8), np.empty((0, 3), np.float32),
+                           np.empty((0, 3), np.float32))
     xy = np.rint([k.pt for k in keypoints]).astype(np.int32)
     x, y = xy.T
     xyz, confidence = sample_geometry(y, x)
@@ -71,19 +74,23 @@ def observe(index, descriptor, gray, pose, detector, sample_geometry, min_confid
     if np.any(lengths <= 0):
         raise ValueError("相机旋转产生了无效射线")
     return Observation(index, descriptor / norm, cells, features[reliable],
-                       (rays / lengths).astype(np.float32))
+                       (rays / lengths).astype(np.float32), xyz.astype(np.float32))
 
 
-def compare(candidate, reference, matcher):
-    """覆盖率以候选帧的有效网格为分母，视差扣除了相机旋转。"""
+def mutual_matches(candidate, reference, matcher):
     if min(len(candidate.features), len(reference.features)) < 8:
-        return 0.0, 0.0
+        return []
     # 比率检验排除重复纹理，反向最近邻剔除多点争抢同一对应。
     pairs = matcher.knnMatch(candidate.features, reference.features, k=2)
     reverse = {m.queryIdx: m.trainIdx
                for m in matcher.match(reference.features, candidate.features)}
-    good = [a for a, b in pairs
+    return [a for a, b in pairs
             if a.distance < 0.75 * b.distance and reverse.get(a.trainIdx) == a.queryIdx]
+
+
+def compare(candidate, reference, matcher):
+    """覆盖率以候选帧的有效网格为分母，视差扣除了相机旋转。"""
+    good = mutual_matches(candidate, reference, matcher)
     if len(good) < 8:
         return 0.0, 0.0
     query = [m.queryIdx for m in good]

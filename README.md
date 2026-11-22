@@ -33,3 +33,34 @@ from vggt_slam.frame_overlap import FrameTracker
 
 indices = list(motion_keyframes(paths, FrameTracker()))
 ```
+
+## 窗外历史帧的首发位姿实验
+
+每次运行生成 `trajectory.jsonl`，每个实际输入对应一行。`raw` 和 `pose` 分别记录主干和发布的相机到世界 4×4 矩阵。Python 接口从 `StreamStep.published_pose` 读取发布位姿。用局部点图生成修正点云时，对每个局部点应用该位姿。模型预测字典仍使用原网络的坐标。
+
+| `--pose-mode` | 当前帧可读取的几何参考 |
+| --- | --- |
+| `baseline`（默认） | 原版冻结主干的近期窗口 |
+| `anchors` | 额外从已提交锚中按余弦相似度检索最多 6 张窗外帧 |
+| `fixed` | 在历史锚之外保留最初 3 张真实帧，离开近期窗口后可用，按帧号去重 |
+
+两种修正模式逐候选用 ORB 匹配和归一化像面 PnP-RANSAC 求姿态。通过内点覆盖、正深度、尺度与先验幅度检查后，选内点最多的一个参考，旋转和平移各融合半步。无参考通过时沿上一发布位姿累积原始相邻变换。每次记录候选编号、采用的参考和内点数。固定半步是实验初值，多参考联合最小二乘、三个全历史摘要和 TTT 仍待研究。
+
+在同一新输出根目录下复现实验，可分别运行三种模式。以下命令从仓库根目录执行，`RGB` 和 `CHECKPOINT` 分别指向图像目录和本地权重。
+
+```bash
+for mode in baseline anchors fixed; do
+  python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" \
+    --pose-mode "$mode" --output "runs/$mode" || break
+done
+```
+
+2026 年 11 月 22 日在 RTX 3090、BF16、SDPA 上，使用 ABot-Recon 版本 `6e3b2e1` 对 ScanNet v2 的 `scene0000_00` 起始连续 120 帧（0–119）各运行一次。三组原始预测位姿逐元素一致。用对应帧的 ScanNet 相机中心作参考，按整段 Sim(3) 对齐后计算平移 RMSE。
+
+| 模式 | 采用几何修正的帧数 | ATE RMSE |
+| --- | ---: | ---: |
+| baseline | 0 | 2.804 厘米 |
+| anchors | 91 | 3.534 厘米 |
+| fixed | 92 | 3.034 厘米 |
+
+该片段上，两种修正都增大了误差。三万帧漂移、跨场景泛化和点云精度尚待独立评测。
