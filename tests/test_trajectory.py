@@ -5,7 +5,9 @@ import cv2
 import numpy as np
 
 from stream_reconstruction.selection import Decision, Observation
-from stream_reconstruction.trajectory import PoseMemory, Reference, estimate_pose
+from stream_reconstruction.trajectory import (
+    PoseEvidence, PoseMemory, Reference, estimate_pose, joint_step, pose_evidence,
+)
 
 
 def scene():
@@ -61,3 +63,33 @@ class TrajectoryTests(unittest.TestCase):
         invalid = replace(ref, index=3, features=ref.features[:0])
         result, _ = memory.advance(invalid, raw, Decision(2, 3, False, "测试"))
         np.testing.assert_allclose(result, corrected)
+
+    def test_joint_reduces_pose_error_with_shared_features(self):
+        reference = scene()
+        expected = np.eye(4)
+        expected[:3, :3] = cv2.Rodrigues(np.array([0., 0.018, 0.]))[0]
+        expected[:3, 3] = [0.06, -0.02, 0.04]
+        current = replace(reference, local_points=(
+            reference.local_points - expected[:3, 3]) @ expected[:3, :3])
+        prior = np.eye(4)
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+        # 第二个参考来自不同相机系，世界点与第一个参考一致。
+        other = np.eye(4)
+        other[:3, 3] = [-0.3, 0., 0.]
+        second = replace(reference, index=1, local_points=(
+            reference.local_points - other[:3, 3]))
+        matches = [pose_evidence(current, Reference(obs, pose), matcher, prior)
+                   for obs, pose in [(reference, prior), (second, other)]]
+        self.assertIsNone(joint_step(prior, current, matches[:1]))
+        count, solved = joint_step(prior, current, matches)
+        self.assertEqual(count, len(current.features))
+        self.assertLess(np.linalg.norm(solved - expected), np.linalg.norm(prior - expected))
+        _, with_duplicate = joint_step(prior, current, [*matches, *matches])
+        np.testing.assert_allclose(solved, with_duplicate, atol=1e-10)
+
+    def test_joint_rejects_rank_deficiency(self):
+        current = scene()
+        queries = np.arange(12)
+        points = np.tile([0., 0., 4.], (len(queries), 1))
+        matches = [PoseEvidence(i, queries, points, np.eye(4)) for i in range(2)]
+        self.assertIsNone(joint_step(np.eye(4), current, matches))

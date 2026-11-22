@@ -47,10 +47,14 @@ def main():
     parser.add_argument("--revise-depth", action="store_true", help="保存四步几何融合后的锚帧深度")
     parser.add_argument("--pose-mode", choices=("baseline", "anchors", "fixed"), default="baseline",
                         help="选择原始位姿、历史锚，或历史锚加起始三帧")
+    parser.add_argument("--pose-solver", choices=("single", "joint"), default="single",
+                        help="选择单参考半步融合或多参考联合求解")
     args = parser.parse_args()
     config = SelectionConfig(lookahead=args.lookahead, capacity=args.capacity, min_gap=args.min_gap)
     if args.revise_depth and args.lookahead != 4:
         parser.error("四步深度融合需要 --lookahead 4")
+    if args.pose_mode == "baseline" and args.pose_solver == "joint":
+        parser.error("联合求解需要 --pose-mode anchors 或 fixed")
     paths = input_paths(args.source)
     from abot_recon import ABotRecon
 
@@ -61,7 +65,7 @@ def main():
     log = args.output / "decisions.jsonl.part"
     trajectory = args.output / "trajectory.jsonl.part"
     steps = reconstruct(wrapper.model.network.eval(), paths, config, revise_depth=args.revise_depth,
-                        pose_mode=args.pose_mode)
+                        pose_mode=args.pose_mode, pose_solver=args.pose_solver)
     with (closing(steps), log.open("x", encoding="utf-8") as stream,
           trajectory.open("x", encoding="utf-8") as poses):
         for step in steps:
@@ -69,6 +73,7 @@ def main():
                 raw = step.prediction["camera_poses"][0, 0].detach().float().cpu().tolist()
                 entry = dict(index=step.index, image=paths[step.index].name, raw=raw,
                              pose=step.published_pose.tolist(), mode=args.pose_mode,
+                             solver=args.pose_solver,
                              **step.pose_evidence)
                 poses.write(json.dumps(entry, ensure_ascii=False, allow_nan=False) + "\n")
             if step.decision is None:

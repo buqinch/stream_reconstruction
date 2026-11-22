@@ -44,14 +44,18 @@ indices = list(motion_keyframes(paths, FrameTracker()))
 | `anchors` | 额外从已提交锚中按余弦相似度检索最多 6 张窗外帧 |
 | `fixed` | 在历史锚之外保留最初 3 张真实帧，离开近期窗口后可用，按帧号去重 |
 
-两种修正模式逐候选用 ORB 匹配和归一化像面 PnP-RANSAC 求姿态。通过内点覆盖、正深度、尺度与先验幅度检查后，选内点最多的一个参考，旋转和平移各融合半步。无参考通过时沿上一发布位姿累积原始相邻变换。每次记录候选编号、采用的参考和内点数。固定半步是实验初值，多参考联合最小二乘、三个全历史摘要和 TTT 仍待研究。
+两种修正模式逐候选用 ORB 匹配和归一化像面 PnP-RANSAC 核对内点覆盖、正深度、尺度与位姿更新幅度。默认 `--pose-solver single` 采用内点最多的参考，将旋转和平移各融合半步。`--pose-solver joint` 至少需要两个通过检查的参考，使用它们的内点做一次六自由度稳健高斯–牛顿求解。重复出现的当前特征共享观测权重，平移步长按中位深度归一化。联合更新须通过可观测性、幅度和带先验目标下降的检查。没有可用更新时，沿上一发布位姿累积原始相邻变换。
+
+`trajectory.jsonl` 中，`candidates` 记录检索结果，`verified` 记录通过 PnP 检查的参考，`references` 记录实际采用的参考。`inliers` 记录参与发布计算的不同当前特征数。Python 接口使用 `pose_solver="joint"` 启用联合求解。三个全历史摘要和 TTT 仍待研究。
 
 在同一新输出根目录下复现实验，可分别运行三种模式。以下命令从仓库根目录执行，`RGB` 和 `CHECKPOINT` 分别指向图像目录和本地权重。
 
 ```bash
-for mode in baseline anchors fixed; do
+for variant in baseline:single anchors:single fixed:single anchors:joint fixed:joint; do
+  mode=${variant%:*}
+  solver=${variant#*:}
   python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" \
-    --pose-mode "$mode" --output "runs/$mode" || break
+    --pose-mode "$mode" --pose-solver "$solver" --output "runs/$mode-$solver" || break
 done
 ```
 
@@ -64,3 +68,17 @@ done
 | fixed | 92 | 3.034 厘米 |
 
 该片段上，两种修正都增大了误差。三万帧漂移、跨场景泛化和点云精度尚待独立评测。
+
+### 两场景联合求解对照
+
+相同权重和推理设置下，使用 ScanNet 的 `scene0000_00` 前 600 帧与 `scene0062_00` 前 300 帧。每条序列运行五个配置，五组主干位姿逐元素一致，锚帧决策也一致。每个单元格依次给出整段 Sim(3) 对齐后的 ATE RMSE，以及只用前 120 帧拟合 Sim(3) 后计算的后缀平移 RMSE，单位为厘米。参考位姿取自同一传感器文件，帧间误差按帧数计算。
+
+| 配置 | scene0000_00（600 帧） | scene0062_00（300 帧） |
+| --- | ---: | ---: |
+| 基线 | 20.02 / 38.72 | 4.49 / 16.68 |
+| 历史锚，单参考 | 8.93 / **12.74** | 4.55 / 15.72 |
+| 历史锚与固定帧，单参考 | **8.60** / 18.22 | 4.05 / 13.29 |
+| 历史锚，联合 | 14.44 / 28.23 | **3.70** / **8.83** |
+| 历史锚与固定帧，联合 | 14.45 / 28.38 | 3.86 / 9.85 |
+
+仅历史锚的联合求解在两个片段中都降低了相对基线的后缀平移误差，最佳求解器随场景而变。120 帧间隔的相对旋转 RMSE 分别从基线的 2.86°、2.83° 降至 2.36°、1.71°。这两条片段共 900 帧，长序列和跨场景收益仍需更广泛验证。

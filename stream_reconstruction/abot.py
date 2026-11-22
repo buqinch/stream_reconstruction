@@ -39,17 +39,20 @@ def motion_keyframes(paths, tracker, threshold=50):
             yield index
 
 
-def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False, pose_mode="baseline"):
+def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
+                pose_mode="baseline", pose_solver="single"):
     """逐帧返回原模型预测及到期决定，首版预测由调用方按需消费。"""
     import torch
     from abot_recon.modeling.streaming.core.cache_utils import detach_carry
 
     if revise_depth and config.lookahead != DELAY:
         raise ValueError("既有深度融合需要四个后续输入")
+    if pose_mode == "baseline" and pose_solver != "single":
+        raise ValueError("联合求解需要历史锚或固定帧模式")
     device = next(network.parameters()).device
     selector = AnchorSelector(config)
     memory = None if pose_mode == "baseline" else PoseMemory(
-        pose_mode, config.capacity, network.local_window_frames)
+        pose_mode, config.capacity, network.local_window_frames, solver=pose_solver)
     detector = cv2.ORB_create(nfeatures=192)
     geometry = deque(maxlen=DELAY + 1)
     carry = reference = camera_state = descriptor = None
