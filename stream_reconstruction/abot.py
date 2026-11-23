@@ -44,7 +44,8 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
                 pose_mode="baseline", pose_solver="single", summary="off",
                 direction_gain=1., summary_alignment="single", ttt="off", profile=False,
                 gate_parameters=None, training_evidence=None, visual_context="structured24",
-                visual_gate=None, gradient_interval=0, visual_ttt=False):
+                visual_gate=None, gradient_interval=0, visual_ttt=False,
+                prefix_fast_weights=False):
     """逐帧返回原模型预测及到期决定，首版预测由调用方按需消费。"""
     import torch
     from abot_recon.modeling.streaming.core.cache_utils import detach_carry
@@ -62,6 +63,8 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
     if gradient_interval < 0 or (gradient_interval and visual_gate is None):
         raise ValueError("逐帧反传需要视觉门及正的采样间隔")
     adaptation = None
+    if prefix_fast_weights and (visual_ttt or gradient_interval):
+        raise ValueError("前缀快权重需独立运行")
     if visual_ttt:
         from copy import copy, deepcopy
 
@@ -72,7 +75,8 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
         visual_gate = deepcopy(visual_gate).requires_grad_(True)
         adaptation = VisualTTT(visual_gate)
         gradient_interval = adaptation.interval
-    network, visual = stream_network(network, config, visual_context, visual_gate)
+    network, visual = stream_network(network, config, visual_context, visual_gate,
+                                     prefix_fast_weights=prefix_fast_weights)
     selector = AnchorSelector(config)
     memory = None if pose_mode == "baseline" else PoseMemory(
         pose_mode, config.capacity, RECENT, solver=pose_solver, summary=summary,

@@ -36,7 +36,7 @@ class FrameEncoder(torch.nn.Module):
         return output
 
 
-def stream_network(network, config, mode, visual_gate=None):
+def stream_network(network, config, mode, visual_gate=None, *, prefix_fast_weights=False):
     if mode not in ("structured24", "local12"):
         raise ValueError("视觉窗口须选择 structured24 或 local12")
     if network.local_window_frames != RECENT:
@@ -44,11 +44,14 @@ def stream_network(network, config, mode, visual_gate=None):
     context = None
     if visual_gate is not None and mode != "structured24":
         raise ValueError("视觉门需要 structured24 模式")
+    if prefix_fast_weights and visual_gate is None:
+        raise ValueError("前缀快权重需要视觉门")
     if mode == "structured24":
         if network.global_pos_encoding != "rope3d" or network.use_global_points:
             raise ValueError("结构化窗口需要发布模型的三维 RoPE 和局部点图头")
         context = VisualContext(network.num_global_decoder_blocks, network.rope3d_embed,
-                                config, visual_gate=visual_gate)
+                                config, visual_gate=visual_gate,
+                                prefix_fast_weights=prefix_fast_weights)
     # 每条流有自己的编码器入口和缓存管理器。注册表浅拷贝，参数及预测头共享。
     runtime = copy(network)
     runtime._modules = network._modules.copy()
@@ -96,9 +99,14 @@ class VisualSummary:
 class VisualContext:
     """单条流的缓存管理器，接口对应上游 paged_stream_forward 的两个回调。"""
 
-    def __init__(self, layers, rope, config, *, visual_gate=None):
+    def __init__(self, layers, rope, config, *, visual_gate=None, prefix_fast_weights=False):
         self.layers = layers
         self.visual_gate = visual_gate
+        self.prefix = None
+        if prefix_fast_weights:
+            from .prefix_fast_weights import PrefixFastWeights
+
+            self.prefix = PrefixFastWeights(rope)
         self.rope = rope
         self.lookahead = config.lookahead
         self.recent = deque()
@@ -184,6 +192,15 @@ class VisualContext:
                 if group:
                     expanded = torch.cat([recent] + [kv[layer_idx] for kv in group], dim=1)
                     mixed = mixed + weight.to(local.dtype) * (self.attend(query, expanded) - local)
+            if self.prefix is not None:
+                with torch.autocast(device_type=query.device.type, enabled=False):
+                    if self.prefix.calibration is None:
+                        self.prefix.collect(current, self.current.index)
+                        if self.prefix.calibration is not None:
+                            self.trace["prefix_calibration"] = self.prefix.calibration
+                    elif self.prefix.weights is not None:
+                        mixed = self.prefix.read(query, mixed, self.current.index)
+                        self.trace["prefix_fast_weights_applied"] = True
             return mixed
         if self.selected:
             current = torch.cat([kv[layer_idx] for kv in self.selected] + [current], dim=1)

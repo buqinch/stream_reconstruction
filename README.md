@@ -82,6 +82,18 @@ python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" \
 
 对照使用相同权重和输入，省略 `--visual-ttt` 即可。`trajectory.jsonl` 的 `visual_ttt` 记录触发、参考和接受状态。每次候选重放计入 `--profile` 延迟。
 
+### 前缀快权重
+
+`--prefix-fast-weights` 收集序列前 12 帧最后一层跨帧注意力的 K/V。先用前 10 帧按注意力头拟合带 L2 正则的 K→V 线性映射，再用第 11、12 帧比较拟合误差与均值预测。通过后用 12 帧重拟合一次，后续帧的 Q 从固定大小的快权重读出，并以 5% 比例融合到已有的视觉门输出。K 和 Q 统一时间 RoPE 相位。 [tttLRM 的快权重读写机制](https://arxiv.org/html/2602.20160v2#S3)
+
+```bash
+python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" \
+  --output runs/visual-prefix --pose-mode baseline --visual-context structured24 \
+  --visual-gate-weights "$GATE_WEIGHTS" --prefix-fast-weights --profile
+```
+
+`trajectory.jsonl` 的 `prefix_calibration` 记录留出帧拟合结果，`prefix_fast_weights_applied` 标记使用快权重的帧。拟合和读取都用测试序列的视觉张量，无需外部相机位姿。
+
 ## 选帧规则
 
 1. 单次提取空间 patch token，做平均池化并进行 L2 归一化。每帧最多采集 192 个 ORB 特征，读取对应像素的预测局部三维点和置信度，将局部射线旋转到共同的世界坐标系。

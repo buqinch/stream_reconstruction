@@ -51,8 +51,11 @@ def main():
                         help="主干读取 12＋6＋3＋3 个视觉位置，或使用原始 12 帧对照")
     parser.add_argument("--visual-gate-weights", type=Path,
                         help="最后一层视觉注意力的历史融合门 JSON")
-    parser.add_argument("--visual-ttt", action="store_true",
-                        help="用历史共视点在线微调视觉注意力门")
+    adaptation = parser.add_mutually_exclusive_group()
+    adaptation.add_argument("--visual-ttt", action="store_true",
+                            help="用历史共视点在线微调视觉注意力门")
+    adaptation.add_argument("--prefix-fast-weights", action="store_true",
+                            help="用前 12 帧拟合会话快权重，从第 13 帧使用")
     parser.add_argument("--revise-depth", action="store_true", help="保存四步几何融合后的锚帧深度")
     parser.add_argument("--pose-mode", choices=("baseline", "anchors", "fixed"), default="baseline",
                         help="选择原始位姿、历史锚，或历史锚加起始三帧")
@@ -78,6 +81,8 @@ def main():
         parser.error("视觉门权重需要 --visual-context structured24")
     if args.visual_ttt and not args.visual_gate_weights:
         parser.error("视觉 TTT 需要 --visual-gate-weights 初始化")
+    if args.prefix_fast_weights and not args.visual_gate_weights:
+        parser.error("前缀快权重需要 --visual-gate-weights")
     visual_gate = None
     if args.visual_gate_weights:
         from .visual_gate import VisualHistoryGate
@@ -135,7 +140,8 @@ def main():
                         direction_gain=args.direction_gain, summary_alignment=args.summary_alignment,
                         ttt=args.ttt, profile=args.profile, gate_parameters=gate_parameters,
                         training_evidence=training_evidence, visual_context=args.visual_context,
-                        visual_gate=visual_gate, visual_ttt=args.visual_ttt)
+                        visual_gate=visual_gate, visual_ttt=args.visual_ttt,
+                        prefix_fast_weights=args.prefix_fast_weights)
     with (closing(steps), log.open("x", encoding="utf-8") as stream,
           trajectory.open("x", encoding="utf-8") as poses):
         started = perf_counter()
