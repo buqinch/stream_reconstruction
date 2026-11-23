@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from stream_reconstruction.selection import SelectionConfig
-from stream_reconstruction.train_visual_gate import motion_loss
+from stream_reconstruction.train_visual_gate import LONG_HORIZONS, balanced_scores, compose_pose, motion_loss
 from stream_reconstruction.visual_context import VisualContext
 from stream_reconstruction.visual_gate import VisualHistoryGate
 from test_visual_context import feed, memory
@@ -49,6 +49,31 @@ class VisualGateTests(unittest.TestCase):
         loss.backward()
         self.assertGreater(loss.item(), 0.)
         self.assertGreater(pose.grad[0, 3].item(), 0.)
+
+    def test_long_motion_objective_backpropagates_to_two_steps_in_block(self):
+        first = torch.eye(4)
+        first[0, 3] = .1
+        first.requires_grad_()
+        second = torch.eye(4)
+        second[0, 3] = .2
+        second.requires_grad_()
+        pose = compose_pose(second, first, first)
+        targets = np.full((len(LONG_HORIZONS), 4, 4), np.nan)
+        targets[-1] = np.eye(4)
+        loss = motion_loss(pose, [torch.eye(4)] * 64, targets, LONG_HORIZONS)
+        loss.backward()
+        self.assertGreater(first.grad[0, 3].item(), 0.)
+        self.assertGreater(second.grad[0, 3].item(), 0.)
+
+    def test_balanced_selection_accounts_for_rotation_and_translation(self):
+        metrics = {
+            "local12": dict(ate_m=.2, suffix_m=.5, rpe_long=dict(rotation_deg=5.)),
+            "low_ate": dict(ate_m=.15, suffix_m=.6, rpe_long=dict(rotation_deg=6.)),
+            "balanced": dict(ate_m=.18, suffix_m=.47, rpe_long=dict(rotation_deg=4.8)),
+        }
+        scores = balanced_scores(metrics)
+        self.assertEqual(scores["local12"], 1.)
+        self.assertLess(scores["balanced"], scores["low_ate"])
 
     def test_weight_loader_validates_shape(self):
         with tempfile.TemporaryDirectory() as directory:
