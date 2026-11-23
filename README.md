@@ -70,6 +70,18 @@ python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" \
 
 相同数据下，长程训练按综合误差选中第 1 轮。两条 1000 帧测试中，相对首轮微调，`scene0140_00` 的 ATE 从 17.46 降到 16.76 厘米，500 帧旋转 RPE 从 12.15° 降到 10.72°。`scene0070_00` 的 ATE 从 22.27 升到 26.24 厘米，500 帧旋转 RPE 从 12.03° 降到 11.61°。
 
+### 使用历史共视点的视觉 TTT
+
+`--visual-ttt` 从 `--visual-gate-weights` 指定的六参数视觉门启动。冻结其余模型权重，每隔 8 帧尝试从当前视觉上下文中的窗外帧提取通过 PnP 核验的点对应。历史点由模型先前的点图和位姿获得，当前射线取自初次前向的点图。按图像网格划分梯度和核验两组，用角度残差对六参数做一次限幅更新。用相同相机状态重放当前输入，核验组误差下降后，候选权重从下一帧生效。
+
+```bash
+python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" \
+  --output runs/visual-online --pose-mode baseline --visual-context structured24 \
+  --visual-gate-weights "$GATE_WEIGHTS" --visual-ttt --profile
+```
+
+对照使用相同权重和输入，省略 `--visual-ttt` 即可。`trajectory.jsonl` 的 `visual_ttt` 记录触发、参考和接受状态。每次候选重放计入 `--profile` 延迟。
+
 ## 选帧规则
 
 1. 单次提取空间 patch token，做平均池化并进行 L2 归一化。每帧最多采集 192 个 ORB 特征，读取对应像素的预测局部三维点和置信度，将局部射线旋转到共同的世界坐标系。

@@ -44,7 +44,7 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
                 pose_mode="baseline", pose_solver="single", summary="off",
                 direction_gain=1., summary_alignment="single", ttt="off", profile=False,
                 gate_parameters=None, training_evidence=None, visual_context="structured24",
-                visual_gate=None, gradient_interval=0):
+                visual_gate=None, gradient_interval=0, visual_ttt=False):
     """逐帧返回原模型预测及到期决定，首版预测由调用方按需消费。"""
     import torch
     from abot_recon.modeling.streaming.core.cache_utils import detach_carry
@@ -61,6 +61,17 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
     device = next(network.parameters()).device
     if gradient_interval < 0 or (gradient_interval and visual_gate is None):
         raise ValueError("逐帧反传需要视觉门及正的采样间隔")
+    adaptation = None
+    if visual_ttt:
+        from copy import copy, deepcopy
+
+        from .visual_ttt import VisualTTT
+
+        if visual_gate is None or gradient_interval or any(p.requires_grad for p in network.parameters()):
+            raise ValueError("视觉 TTT 需要冻结主干、初始视觉门和独立的在线反传时序")
+        visual_gate = deepcopy(visual_gate).requires_grad_(True)
+        adaptation = VisualTTT(visual_gate)
+        gradient_interval = adaptation.interval
     network, visual = stream_network(network, config, visual_context, visual_gate)
     selector = AnchorSelector(config)
     memory = None if pose_mode == "baseline" else PoseMemory(
@@ -75,6 +86,9 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
         tensor, rgb = _input_image(path)
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         gradient = index >= RECENT and index % gradient_interval == 0 if gradient_interval else False
+        if adaptation is not None and gradient:
+            initial_context = copy(visual)
+            initial_state, initial_reference = camera_state, reference
         grad_context = torch.set_grad_enabled(gradient) if gradient_interval else torch.inference_mode()
         with grad_context, torch.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
@@ -125,8 +139,29 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
                 anchor_bytes, summary_bytes = memory.index_payload_bytes()
                 evidence.update(anchor_index_bytes=anchor_bytes, summary_index_bytes=summary_bytes)
         if visual is not None:
+            if adaptation is not None:
+                update = dict(accepted=False)
+                if gradient:
+                    def replay():
+                        network._paged_manager = network.encoder.context = initial_context
+                        try:
+                            with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                                enabled=device.type == "cuda"):
+                                candidate = network._forward_frame_paged(
+                                    frame, frame_idx=index, ref_hidden=initial_reference,
+                                    camera_state=initial_state)
+                            return candidate["camera_poses"][0, 0].float()
+                        finally:
+                            network._paged_manager = network.encoder.context = visual
+
+                    update = adaptation.update(
+                        observation, pose, prediction["camera_poses"][0, 0].float(),
+                        visual.trace["anchors"] + visual.trace["fixed"], replay)
+                evidence["visual_ttt"] = update
             with torch.no_grad():
                 visual.finish(decision)
+            if adaptation is not None:
+                adaptation.remember(observation, pose, visual)
             evidence["visual_context"] = visual.trace
         corrected = None
         if revise_depth:

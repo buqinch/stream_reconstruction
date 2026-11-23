@@ -51,6 +51,8 @@ def main():
                         help="主干读取 12＋6＋3＋3 个视觉位置，或使用原始 12 帧对照")
     parser.add_argument("--visual-gate-weights", type=Path,
                         help="最后一层视觉注意力的历史融合门 JSON")
+    parser.add_argument("--visual-ttt", action="store_true",
+                        help="用历史共视点在线微调视觉注意力门")
     parser.add_argument("--revise-depth", action="store_true", help="保存四步几何融合后的锚帧深度")
     parser.add_argument("--pose-mode", choices=("baseline", "anchors", "fixed"), default="baseline",
                         help="选择原始位姿、历史锚，或历史锚加起始三帧")
@@ -74,6 +76,8 @@ def main():
     args = parser.parse_args()
     if args.visual_gate_weights and args.visual_context != "structured24":
         parser.error("视觉门权重需要 --visual-context structured24")
+    if args.visual_ttt and not args.visual_gate_weights:
+        parser.error("视觉 TTT 需要 --visual-gate-weights 初始化")
     visual_gate = None
     if args.visual_gate_weights:
         from .visual_gate import VisualHistoryGate
@@ -116,6 +120,8 @@ def main():
 
     if visual_gate is not None:
         visual_gate.to(next(wrapper.model.network.parameters()).device)
+    if args.visual_ttt:
+        wrapper.model.network.requires_grad_(False)
 
     maps = SubmapWriter(args.output / "submaps") if args.submaps else None
     raw_poses, publish_ms, step_ms = [], [], []
@@ -129,11 +135,12 @@ def main():
                         direction_gain=args.direction_gain, summary_alignment=args.summary_alignment,
                         ttt=args.ttt, profile=args.profile, gate_parameters=gate_parameters,
                         training_evidence=training_evidence, visual_context=args.visual_context,
-                        visual_gate=visual_gate)
+                        visual_gate=visual_gate, visual_ttt=args.visual_ttt)
     with (closing(steps), log.open("x", encoding="utf-8") as stream,
           trajectory.open("x", encoding="utf-8") as poses):
         started = perf_counter()
         accepted = 0
+        visual_accepted = 0
         for step in steps:
             if step.prediction is not None:
                 if args.profile:
@@ -149,6 +156,7 @@ def main():
                              **step.pose_evidence)
                 poses.write(json.dumps(entry, ensure_ascii=False, allow_nan=False) + "\n")
                 accepted += bool(entry.get("ttt", {}).get("accepted", False))
+                visual_accepted += bool(entry.get("visual_ttt", {}).get("accepted", False))
                 peak_anchor_bytes = max(peak_anchor_bytes, entry.get("anchor_index_bytes", 0))
                 peak_summary_bytes = max(peak_summary_bytes, entry.get("summary_index_bytes", 0))
                 if args.loop_salad_checkpoint is not None:
@@ -178,6 +186,7 @@ def main():
             end_to_end_p95_ms=float(np.percentile(step_ms, 95)),
             peak_cuda_allocated_bytes=torch.cuda.max_memory_allocated(),
             peak_cuda_reserved_bytes=torch.cuda.max_memory_reserved(), accepted_ttt_updates=accepted,
+            accepted_visual_ttt_updates=visual_accepted,
             peak_anchor_index_bytes=peak_anchor_bytes, peak_summary_index_bytes=peak_summary_bytes))
     if args.loop_salad_checkpoint is not None:
         apply_official_loop(paths, raw_poses, wrapper, args.output, args.loop_salad_checkpoint,
