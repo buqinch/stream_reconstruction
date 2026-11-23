@@ -6,11 +6,13 @@ from dataclasses import asdict
 import json
 import math
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 
 from .abot import reconstruct
 from .selection import SelectionConfig
+from .submaps import SubmapWriter, apply_official_loop, write_manifest
 
 
 def input_paths(source):
@@ -55,6 +57,12 @@ def main():
                         help="方向残差能量权重，范围为 [0, 1]")
     parser.add_argument("--summary-alignment", choices=("single", "consensus"), default="single",
                         help="摘要写入采用单参考或两个不同子图的旋转共识")
+    parser.add_argument("--ttt", choices=("off", "fixed", "online"), default="off",
+                        help="关闭门控、使用同协议的固定门或在线训练门")
+    parser.add_argument("--profile", action="store_true", help="记录首发、端到端延迟及显存")
+    parser.add_argument("--submaps", action="store_true", help="每 10 帧储存子图局部点")
+    parser.add_argument("--loop-salad-checkpoint", type=Path, help="官方回环所需的本地 SALAD 权重")
+    parser.add_argument("--loop-dino-checkpoint", type=Path, help="官方回环所需的本地 DINO 权重")
     args = parser.parse_args()
     config = SelectionConfig(lookahead=args.lookahead, capacity=args.capacity, min_gap=args.min_gap)
     if args.revise_depth and args.lookahead != 4:
@@ -65,6 +73,11 @@ def main():
         parser.error("方向摘要需要 --pose-mode fixed --pose-solver joint")
     if not 0 <= args.direction_gain <= 1:
         parser.error("--direction-gain 须在 [0, 1] 内")
+    if args.ttt != "off" and (args.summary != "full" or not 0 < args.direction_gain < 1):
+        parser.error("门控实验需要全历史摘要及 (0, 1) 内的初始方向权重")
+    loop_paths = (args.loop_salad_checkpoint, args.loop_dino_checkpoint)
+    if any(loop_paths) and not all(path is not None and path.is_file() for path in loop_paths):
+        parser.error("回环需要同时提供有效的本地 SALAD 和 DINO 权重")
     paths = input_paths(args.source)
     from abot_recon import ABotRecon
 
@@ -72,15 +85,26 @@ def main():
         str(args.checkpoint), local_files_only=True, device="cuda",
         attention_backend="sdpa", loop_closure=False)
     args.output.mkdir(parents=True, exist_ok=False)
+    import torch
+
+    maps = SubmapWriter(args.output / "submaps") if args.submaps else None
+    raw_poses, publish_ms, step_ms = [], [], []
+    peak_anchor_bytes = peak_summary_bytes = 0
+    if args.profile:
+        torch.cuda.reset_peak_memory_stats()
     log = args.output / "decisions.jsonl.part"
     trajectory = args.output / "trajectory.jsonl.part"
     steps = reconstruct(wrapper.model.network.eval(), paths, config, revise_depth=args.revise_depth,
                         pose_mode=args.pose_mode, pose_solver=args.pose_solver, summary=args.summary,
-                        direction_gain=args.direction_gain, summary_alignment=args.summary_alignment)
+                        direction_gain=args.direction_gain, summary_alignment=args.summary_alignment,
+                        ttt=args.ttt, profile=args.profile)
     with (closing(steps), log.open("x", encoding="utf-8") as stream,
           trajectory.open("x", encoding="utf-8") as poses):
+        started = perf_counter()
+        accepted = 0
         for step in steps:
             if step.prediction is not None:
+                publish_ms.append((perf_counter() - started) * 1000)
                 raw = step.prediction["camera_poses"][0, 0].detach().float().cpu().tolist()
                 entry = dict(index=step.index, image=paths[step.index].name, raw=raw,
                              pose=step.published_pose.tolist(), mode=args.pose_mode,
@@ -88,15 +112,37 @@ def main():
                              direction_gain=args.direction_gain, summary_alignment=args.summary_alignment,
                              **step.pose_evidence)
                 poses.write(json.dumps(entry, ensure_ascii=False, allow_nan=False) + "\n")
-            if step.decision is None:
-                continue
-            decision = step.decision
-            if step.revised_depth is not None:
-                np.save(args.output / f"depth_{decision.candidate:06d}.npy", step.revised_depth)
-            record = dict(**asdict(decision), image=paths[decision.candidate].name)
-            stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+                accepted += bool(entry.get("ttt", {}).get("accepted", False))
+                peak_anchor_bytes = max(peak_anchor_bytes, entry.get("anchor_index_bytes", 0))
+                peak_summary_bytes = max(peak_summary_bytes, entry.get("summary_index_bytes", 0))
+                if args.loop_salad_checkpoint is not None:
+                    raw_poses.append(raw)
+                if maps is not None:
+                    maps.add(step.index, step.published_pose, step.prediction)
+            if step.decision is not None:
+                decision = step.decision
+                if step.revised_depth is not None:
+                    np.save(args.output / f"depth_{decision.candidate:06d}.npy", step.revised_depth)
+                record = dict(**asdict(decision), image=paths[decision.candidate].name)
+                stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+            ended = perf_counter()
+            if step.prediction is not None:
+                step_ms.append((ended - started) * 1000)
+            started = ended
     trajectory.rename(args.output / "trajectory.jsonl")
     log.rename(args.output / "decisions.jsonl")
+    if maps is not None:
+        maps.finish()
+    if args.profile:
+        write_manifest(args.output / "profile.json", dict(
+            frames=len(publish_ms), first_pose_p95_ms=float(np.percentile(publish_ms, 95)),
+            end_to_end_p95_ms=float(np.percentile(step_ms, 95)),
+            peak_cuda_allocated_bytes=torch.cuda.max_memory_allocated(),
+            peak_cuda_reserved_bytes=torch.cuda.max_memory_reserved(), accepted_ttt_updates=accepted,
+            peak_anchor_index_bytes=peak_anchor_bytes, peak_summary_index_bytes=peak_summary_bytes))
+    if args.loop_salad_checkpoint is not None:
+        apply_official_loop(paths, raw_poses, wrapper, args.output, args.loop_salad_checkpoint,
+                            args.loop_dino_checkpoint, None if maps is None else maps.records)
 
 
 if __name__ == "__main__":

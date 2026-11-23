@@ -42,7 +42,7 @@ def motion_keyframes(paths, tracker, threshold=50):
 
 def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
                 pose_mode="baseline", pose_solver="single", summary="off",
-                direction_gain=1., summary_alignment="single"):
+                direction_gain=1., summary_alignment="single", ttt="off", profile=False):
     """逐帧返回原模型预测及到期决定，首版预测由调用方按需消费。"""
     import torch
     from abot_recon.modeling.streaming.core.cache_utils import detach_carry
@@ -51,13 +51,13 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
         raise ValueError("既有深度融合需要四个后续输入")
     if pose_mode == "baseline" and pose_solver != "single":
         raise ValueError("联合求解需要历史锚或固定帧模式")
-    if pose_mode == "baseline" and summary != "off":
+    if pose_mode == "baseline" and (summary != "off" or ttt != "off"):
         raise ValueError("方向摘要需要固定帧和联合求解模式")
     device = next(network.parameters()).device
     selector = AnchorSelector(config)
     memory = None if pose_mode == "baseline" else PoseMemory(
         pose_mode, config.capacity, network.local_window_frames, solver=pose_solver, summary=summary,
-        direction_gain=direction_gain, alignment=summary_alignment)
+        direction_gain=direction_gain, alignment=summary_alignment, ttt=ttt)
     detector = cv2.ORB_create(nfeatures=192)
     geometry = deque(maxlen=DELAY + 1)
     carry = reference = camera_state = descriptor = None
@@ -115,6 +115,9 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
                     scores = confidence[::8, ::8].float().sigmoid().cpu().numpy()
                     axes = plane_axes(grid, scores, max(0.25, config.min_confidence))
                 published, evidence = memory.advance(observation, pose, decision, axes)
+                if profile:
+                    anchor_bytes, summary_bytes = memory.index_payload_bytes()
+                    evidence.update(anchor_index_bytes=anchor_bytes, summary_index_bytes=summary_bytes)
             corrected = None
             if revise_depth:
                 geometry.append(Frame(
