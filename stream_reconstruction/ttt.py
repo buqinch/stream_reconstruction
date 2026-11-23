@@ -52,6 +52,47 @@ def angular_cost(points, rays, weights):
     return float(weights @ np.where(residual <= 1, residual**2, 2 * residual - 1))
 
 
+def gate_features(frame, matches, directions, rays):
+    """构造点门和方向门各自的偏置与两项质量输入。"""
+    if rays is None:
+        features = np.array([[1., 0., 0.], [1., 0., 0.]])
+    else:
+        _, _, points, observed, weights, _, _ = rays
+        indices = np.concatenate([match.query for match in matches])
+        coverage = len(np.unique(frame.cells[indices])) / 24
+        error = np.linalg.norm(points[:, :2] / points[:, 2:] - observed, axis=1)
+        features = np.array([[1., coverage, min(1., float(weights @ error) / .03)],
+                             [1., 0., 0.]])
+    if directions:
+        features[1, 1] = np.mean([min(1., match.support / 8) for match in directions])
+        features[1, 2] = np.mean([min(1., match.scatter / .03) for match in directions])
+    return features
+
+
+def normal_equations(rays, directions, direction_terms):
+    """为两类几何项分别生成加权前的法方程。"""
+    normals = np.zeros((2, 6, 6))
+    rhs = np.zeros((2, 6))
+    if rays is not None:
+        system, residual = rays[-2:]
+        normals[0] = system.T @ system
+        rhs[0] = system.T @ residual
+    if directions:
+        source, target, weight, direction_system = direction_terms(directions)
+        normals[1] = direction_system.T @ direction_system
+        rhs[1] = direction_system.T @ ((source - target) * weight).ravel()
+    return normals, rhs
+
+
+def solve_update(gains, normals, rhs, regularizer):
+    """求解可微的六自由度高斯–牛顿增量，支持批量。"""
+    import torch
+
+    hessian = regularizer.T @ regularizer + (gains[..., None, None] * normals).sum(-3)
+    gradient = (gains[..., None] * rhs).sum(-2)
+    return torch.linalg.solve(hessian, -gradient[..., None]).squeeze(-1)
+
+
 class OnlineWeights:
     def __init__(self, direction, *, online):
         initial = np.array([0.95, direction], dtype=np.float64)
@@ -71,23 +112,14 @@ class OnlineWeights:
             self.parameters = self.pending
             self.pending = None
         rays = ray_terms(frame, groups[0])
-        if rays is None:
-            features = np.array([[1., 0., 0.], [1., 0., 0.]])
-        else:
-            count, scale, points, observed, weights, system, residual = rays
-            indices = np.concatenate([match.query for match in groups[0]])
-            coverage = len(np.unique(frame.cells[indices])) / 24
-            error = np.linalg.norm(points[:, :2] / points[:, 2:] - observed, axis=1)
-            features = np.array([[1., coverage, min(1., float(weights @ error) / .03)],
-                                 [1., 0., 0.]])
-        if directions:
-            features[1, 1] = np.mean([min(1., match.support / 8) for match in directions])
-            features[1, 2] = np.mean([min(1., match.scatter / .03) for match in directions])
+        features = gate_features(frame, groups[0], directions, rays)
+        coverage = features[0, 1]
         gains = self.gains(self.parameters, features)
         log = dict(applied_previous=applied_previous, point_gain=float(gains[0]),
                    direction_gain=float(gains[1]), triggered=False, accepted=False)
-        if rays is None or frame.index % 8 or count < 16 or coverage < .25:
+        if rays is None or frame.index % 8 or rays[0] < 16 or coverage < .25:
             return *gains, log
+        scale = rays[1]
         training = angular_samples(frame, groups[1], scale)
         validation = angular_samples(frame, groups[2], scale)
         if training is None or validation is None:
@@ -100,12 +132,7 @@ class OnlineWeights:
         if not self.online:
             return *gains, log
 
-        normals = [system.T @ system, np.zeros((6, 6))]
-        rhs = [system.T @ residual, np.zeros(6)]
-        if directions:
-            source, target, weight, direction_system = direction_terms(directions)
-            normals[1] = direction_system.T @ direction_system
-            rhs[1] = direction_system.T @ ((source - target) * weight).ravel()
+        normals, rhs = normal_equations(rays, directions, direction_terms)
         updated = self._gradient_step(features, normals, rhs, regularizer, training)
         if updated is None:
             return *gains, log
@@ -133,10 +160,8 @@ class OnlineWeights:
         with torch.inference_mode(False), torch.enable_grad():
             params = torch.tensor(self.parameters, requires_grad=True)
             gains = (params * torch.tensor(features)).sum(1).sigmoid()
-            hessian = torch.tensor(regularizer.T @ regularizer)
-            hessian += (gains[:, None, None] * torch.tensor(np.stack(normals))).sum(0)
-            gradient = (gains[:, None] * torch.tensor(np.stack(rhs))).sum(0)
-            increment = torch.linalg.solve(hessian, -gradient)
+            increment = solve_update(gains, torch.tensor(np.asarray(normals)), torch.tensor(np.asarray(rhs)),
+                                     torch.tensor(regularizer))
             x, y, z = increment[:3]
             zero = torch.zeros_like(x)
             skew = torch.stack((zero, -z, y, z, zero, -x, -y, x, zero)).reshape(3, 3)

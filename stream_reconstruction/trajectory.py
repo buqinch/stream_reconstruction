@@ -9,7 +9,7 @@ import numpy as np
 
 from .directions import BLOCK_FRAMES, DIRECTION_SIGMA, DirectionMemory
 from .selection import Observation, mutual_matches
-from .ttt import OnlineWeights, split_tracks
+from .ttt import OnlineWeights, gate_features, normal_equations, split_tracks
 
 
 @dataclass
@@ -208,7 +208,8 @@ def summary_alignment(frame, prior, matches, method):
 
 class PoseMemory:
     def __init__(self, mode, capacity, window, solver="single", summary="off", *,
-                 direction_gain=1., alignment="single", ttt="off"):
+                 direction_gain=1., alignment="single", ttt="off",
+                 gate_parameters=None, training_evidence=None):
         if mode not in ('anchors', 'fixed') or window < 1:
             raise ValueError('需要有效的记忆模式和正的近期窗口')
         if solver not in ('single', 'joint'):
@@ -223,6 +224,11 @@ class PoseMemory:
         if ttt != 'off' and (ttt not in ('fixed', 'online') or summary != 'full' or not 0 < direction_gain < 1):
             raise ValueError('门控实验需要全历史摘要及 (0, 1) 内的初始方向权重')
         self.gates = None if ttt == 'off' else OnlineWeights(direction_gain, online=ttt == 'online')
+        if (gate_parameters is not None or training_evidence is not None) and ttt != "fixed":
+            raise ValueError("加载融合门和采集训练证据需要固定门模式")
+        if gate_parameters is not None:
+            self.gates.parameters = gate_parameters.copy()
+        self.training_evidence = training_evidence
         self.recent = deque(maxlen=window - 1)
         self.direction_gain = direction_gain
         self.alignment = alignment
@@ -292,6 +298,14 @@ class PoseMemory:
                 frame, prior, groups, directions, ray_terms, direction_terms, REGULARIZER, joint_step)
         else:
             matches_for_pose = matches
+        if self.training_evidence is not None and self.previous_pose is not None:
+            rays = ray_terms(frame, matches_for_pose)
+            if rays is not None or directions:
+                features = gate_features(frame, matches_for_pose, directions, rays)
+                normals, rhs = normal_equations(rays, directions, direction_terms)
+                local_prior = np.linalg.solve(self.previous_pose, prior)
+                scale = 1. if rays is None else rays[1]
+                self.training_evidence.add(frame.index, local_prior, scale, features, normals, rhs)
         used_directions = []
         if self.solver == 'joint':
             result = joint_step(prior, frame, matches_for_pose, directions,

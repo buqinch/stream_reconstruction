@@ -157,3 +157,40 @@ python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" --output runs/
 | 5000 帧 | 32.276 厘米 | 32.277 厘米 | 41／101 |
 
 目前未观察到在线门相对固定门的精度收益。5000 帧时，固定门与在线门的端到端 P95 分别为 155.0 和 157.2 毫秒，CUDA 峰值实际分配均约 7.38 GiB。该结果来自室内连续序列。
+
+## 监督式离线训练融合门
+
+冻结 ABot 权重，用有参考相机位姿的序列训练点对应门和历史方向门。两门各学习三个系数，根据当前帧的质量指标计算残差权重。训练对带权重的一次高斯–牛顿更新求导，由真实相邻位姿监督，按验证场景的损失选择权重。推理逐帧读取已训练的系数并按输入计算权重，无需参考位姿或梯度更新。
+
+先为每个训练和验证场景采集一次。各场景使用独立的输出目录。
+
+```bash
+python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" --output runs/scene-data \
+  --pose-mode fixed --pose-solver joint --summary full --direction-gain 0.1 \
+  --summary-alignment consensus --ttt fixed --capture-gates
+```
+
+采集生成 `gate_evidence.npz` 及相邻的 `trajectory.jsonl`。参考文件为含 `poses` 的 NPZ，保存与 RGB 顺序严格对应的相机到世界 4×4 矩阵，缺少参考的帧用 NaN 表示。尺度从序列前 120 帧的相机中心估计，起始位置需包含足够的非共线运动。以下清单字段的相对路径均基于清单所在目录。
+
+```json
+{
+  "direction_gain": 0.1,
+  "train": [
+    {"scene": "train-scene", "evidence": "runs/train/gate_evidence.npz", "reference": "data/train/reference.npz"}
+  ],
+  "validation": [
+    {"scene": "validation-scene", "evidence": "runs/validation/gate_evidence.npz", "reference": "data/validation/reference.npz"}
+  ]
+}
+```
+
+```bash
+OMP_NUM_THREADS=1 python -m stream_reconstruction.train_gates manifest.json --output runs/model
+python -m stream_reconstruction "$TEST_RGB" --checkpoint "$CHECKPOINT" --output runs/trained \
+  --pose-mode fixed --pose-solver joint --summary full --direction-gain 0.1 \
+  --summary-alignment consensus --ttt fixed --gate-weights runs/model/gates.json
+```
+
+`history.json` 保存损失、最佳轮次以及各场景的证据与参考文件哈希。若初始权重取得最低验证损失，最佳轮次为 0，保存初始权重。`trajectory.jsonl` 的 `ttt` 字段记录每帧实际使用的两门权重。
+
+在 ScanNet v2 上，使用三个场景训练和一个独立场景选模，选中第 120 轮，单步验证损失下降 7.2%。未参与训练和选模的 `scene0140_00` 前 1000 帧，冻结主干、固定门和训练门的整段 Sim(3) ATE 分别为 16.67、15.42 和 15.44 厘米。此前研究过的另一场景 `scene0070_00` 前 1000 帧，固定门和训练门的 ATE 分别为 20.42 和 24.82 厘米。基于这些结果，训练权重作为实验选项手动加载。

@@ -12,6 +12,7 @@ import numpy as np
 
 from .abot import reconstruct
 from .selection import SelectionConfig
+from .gate_data import GateEvidence, load_gate_weights
 from .submaps import SubmapWriter, apply_official_loop, write_manifest
 
 
@@ -59,6 +60,9 @@ def main():
                         help="摘要写入采用单参考或两个不同子图的旋转共识")
     parser.add_argument("--ttt", choices=("off", "fixed", "online"), default="off",
                         help="关闭门控、使用同协议的固定门或在线训练门")
+    gate_options = parser.add_mutually_exclusive_group()
+    gate_options.add_argument("--gate-weights", type=Path, help="离线训练生成的融合门 JSON")
+    gate_options.add_argument("--capture-gates", action="store_true", help="导出供离线训练使用的几何线性系统")
     parser.add_argument("--profile", action="store_true", help="记录首发、端到端延迟及显存")
     parser.add_argument("--submaps", action="store_true", help="每 10 帧储存子图局部点")
     parser.add_argument("--loop-salad-checkpoint", type=Path, help="官方回环所需的本地 SALAD 权重")
@@ -75,6 +79,15 @@ def main():
         parser.error("--direction-gain 须在 [0, 1] 内")
     if args.ttt != "off" and (args.summary != "full" or not 0 < args.direction_gain < 1):
         parser.error("门控实验需要全历史摘要及 (0, 1) 内的初始方向权重")
+    if (args.gate_weights or args.capture_gates) and args.ttt != "fixed":
+        parser.error("融合门加载和采集需要 --ttt fixed")
+    gate_parameters = None
+    if args.gate_weights:
+        try:
+            gate_parameters = load_gate_weights(args.gate_weights)
+        except (OSError, TypeError, ValueError) as error:
+            parser.error(f"融合门加载失败：{error}")
+    training_evidence = GateEvidence() if args.capture_gates else None
     loop_paths = (args.loop_salad_checkpoint, args.loop_dino_checkpoint)
     if any(loop_paths) and not all(path is not None and path.is_file() for path in loop_paths):
         parser.error("回环需要同时提供有效的本地 SALAD 和 DINO 权重")
@@ -97,7 +110,8 @@ def main():
     steps = reconstruct(wrapper.model.network.eval(), paths, config, revise_depth=args.revise_depth,
                         pose_mode=args.pose_mode, pose_solver=args.pose_solver, summary=args.summary,
                         direction_gain=args.direction_gain, summary_alignment=args.summary_alignment,
-                        ttt=args.ttt, profile=args.profile)
+                        ttt=args.ttt, profile=args.profile, gate_parameters=gate_parameters,
+                        training_evidence=training_evidence)
     with (closing(steps), log.open("x", encoding="utf-8") as stream,
           trajectory.open("x", encoding="utf-8") as poses):
         started = perf_counter()
@@ -129,6 +143,8 @@ def main():
             if step.prediction is not None:
                 step_ms.append((ended - started) * 1000)
             started = ended
+    if training_evidence is not None:
+        training_evidence.save(args.output / "gate_evidence.npz", len(paths), args.direction_gain)
     trajectory.rename(args.output / "trajectory.jsonl")
     log.rename(args.output / "decisions.jsonl")
     if maps is not None:
