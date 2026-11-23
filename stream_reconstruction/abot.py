@@ -43,7 +43,8 @@ def motion_keyframes(paths, tracker, threshold=50):
 def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
                 pose_mode="baseline", pose_solver="single", summary="off",
                 direction_gain=1., summary_alignment="single", ttt="off", profile=False,
-                gate_parameters=None, training_evidence=None, visual_context="structured24"):
+                gate_parameters=None, training_evidence=None, visual_context="structured24",
+                visual_gate=None, gradient_interval=0):
     """逐帧返回原模型预测及到期决定，首版预测由调用方按需消费。"""
     import torch
     from abot_recon.modeling.streaming.core.cache_utils import detach_carry
@@ -58,7 +59,9 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
                                     gate_parameters is not None or training_evidence is not None):
         raise ValueError("方向摘要需要固定帧和联合求解模式")
     device = next(network.parameters()).device
-    network, visual = stream_network(network, config, visual_context)
+    if gradient_interval < 0 or (gradient_interval and visual_gate is None):
+        raise ValueError("逐帧反传需要视觉门及正的采样间隔")
+    network, visual = stream_network(network, config, visual_context, visual_gate)
     selector = AnchorSelector(config)
     memory = None if pose_mode == "baseline" else PoseMemory(
         pose_mode, config.capacity, RECENT, solver=pose_solver, summary=summary,
@@ -71,7 +74,9 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
     for index, path in enumerate(paths):
         tensor, rgb = _input_image(path)
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        with torch.inference_mode(), torch.autocast(
+        gradient = index >= RECENT and index % gradient_interval == 0 if gradient_interval else False
+        grad_context = torch.set_grad_enabled(gradient) if gradient_interval else torch.inference_mode()
+        with grad_context, torch.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
         ):
             dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
@@ -100,8 +105,8 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
         def sample_geometry(y, x):
             rows = torch.as_tensor(y, device=device)
             cols = torch.as_tensor(x, device=device)
-            values = points[rows, cols].float().cpu().numpy()
-            weights = confidence[rows, cols].float().sigmoid().cpu().numpy()
+            values = points[rows, cols].detach().float().cpu().numpy()
+            weights = confidence[rows, cols].detach().float().sigmoid().cpu().numpy()
             return values, weights
 
         observation = observe(
@@ -120,7 +125,7 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
                 anchor_bytes, summary_bytes = memory.index_payload_bytes()
                 evidence.update(anchor_index_bytes=anchor_bytes, summary_index_bytes=summary_bytes)
         if visual is not None:
-            with torch.inference_mode():
+            with torch.no_grad():
                 visual.finish(decision)
             evidence["visual_context"] = visual.trace
         corrected = None

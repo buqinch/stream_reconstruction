@@ -36,16 +36,19 @@ class FrameEncoder(torch.nn.Module):
         return output
 
 
-def stream_network(network, config, mode):
+def stream_network(network, config, mode, visual_gate=None):
     if mode not in ("structured24", "local12"):
         raise ValueError("视觉窗口须选择 structured24 或 local12")
     if network.local_window_frames != RECENT:
         raise ValueError("请从发布模型的 12 帧配置启动视觉窗口实验")
     context = None
+    if visual_gate is not None and mode != "structured24":
+        raise ValueError("视觉门需要 structured24 模式")
     if mode == "structured24":
         if network.global_pos_encoding != "rope3d" or network.use_global_points:
             raise ValueError("结构化窗口需要发布模型的三维 RoPE 和局部点图头")
-        context = VisualContext(network.num_global_decoder_blocks, network.rope3d_embed, config)
+        context = VisualContext(network.num_global_decoder_blocks, network.rope3d_embed,
+                                config, visual_gate=visual_gate)
     # 每条流有自己的编码器入口和缓存管理器。注册表浅拷贝，参数及预测头共享。
     runtime = copy(network)
     runtime._modules = network._modules.copy()
@@ -93,8 +96,9 @@ class VisualSummary:
 class VisualContext:
     """单条流的缓存管理器，接口对应上游 paged_stream_forward 的两个回调。"""
 
-    def __init__(self, layers, rope, config):
+    def __init__(self, layers, rope, config, *, visual_gate=None):
         self.layers = layers
+        self.visual_gate = visual_gate
         self.rope = rope
         self.lookahead = config.lookahead
         self.recent = deque()
@@ -132,6 +136,16 @@ class VisualContext:
                           summaries=[dict(slot=i, count=g.count, first=g.first, last=g.last)
                                      for i, g in active],
                           positions=len(self.selected) + 1)
+        if self.visual_gate is not None:
+            self.history_groups = (
+                [f.kv for f in self.fixed], [f.kv for f in anchors], [g.kv for _, g in active])
+            descriptors = ([f.descriptor for f in self.fixed], [f.descriptor for f in anchors],
+                           [g.center for _, g in active])
+            self.similarity = [
+                max((float(item @ self.current.descriptor) / max(np.linalg.norm(item), 1e-8)
+                     for item in group), default=0.)
+                for group in descriptors
+            ]
 
     def append_frame(self, layer_idx, keys, values):
         if self.current is None or layer_idx != self.written_layers or layer_idx >= self.layers:
@@ -139,21 +153,43 @@ class VisualContext:
         if layer_idx == 0:
             self.current.kv = keys.new_empty((self.layers, 2, *keys.shape))
         layer = self.current.kv[layer_idx]
-        layer[0].copy_(keys)
-        layer[1].copy_(values)
+        layer[0].copy_(keys.detach())
+        layer[1].copy_(values.detach())
         self.written_layers += 1
+
+    @staticmethod
+    def attend(query, cache):
+        keys, values = cache.unbind(0)
+        attended = scaled_dot_product_attention(
+            query.transpose(0, 1)[None], keys.transpose(0, 1)[None], values.transpose(0, 1)[None])
+        return attended[0].transpose(0, 1)
 
     def compute_attention(self, layer_idx, query):
         # 上游已完成 Q/K 归一化和真实时间的三维 RoPE，每槽有一整帧 token。
         current = self.current.kv[layer_idx]
+        if self.visual_gate is not None:
+            recent = torch.cat([f.kv[layer_idx] for f in self.recent] + [current], dim=1)
+            local = self.attend(query, recent)
+            if layer_idx != self.layers - 1:
+                return local
+            weights = self.visual_gate(torch.tensor(self.similarity, dtype=torch.float32,
+                                                    device=query.device))
+            self.trace.update(tokens_per_position=query.shape[0],
+                              key_tokens=recent.shape[1] + query.shape[0] * max(map(len, self.history_groups)),
+                              history_weights=[float(weight) if group else 0.
+                                               for weight, group in zip(weights.detach().tolist(),
+                                                                        self.history_groups)])
+            mixed = local
+            for weight, group in zip(weights, self.history_groups):
+                if group:
+                    expanded = torch.cat([recent] + [kv[layer_idx] for kv in group], dim=1)
+                    mixed = mixed + weight.to(local.dtype) * (self.attend(query, expanded) - local)
+            return mixed
         if self.selected:
             current = torch.cat([kv[layer_idx] for kv in self.selected] + [current], dim=1)
-        keys, values = current.unbind(0)
         if layer_idx == 0:
-            self.trace.update(tokens_per_position=query.shape[0], key_tokens=keys.shape[0])
-        attended = scaled_dot_product_attention(
-            query.transpose(0, 1)[None], keys.transpose(0, 1)[None], values.transpose(0, 1)[None])
-        return attended[0].transpose(0, 1)
+            self.trace.update(tokens_per_position=query.shape[0], key_tokens=current.shape[1])
+        return self.attend(query, current)
 
     def _archive(self, frame):
         if len(self.summaries) < SUMMARIES:

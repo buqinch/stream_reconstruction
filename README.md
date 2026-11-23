@@ -46,6 +46,24 @@ python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" --output runs/
 
 在同一帧与同一前缀状态下，分别移除固定帧、历史锚和视觉摘要，这三种操作都改变了正式权重输出的位姿、局部点图和置信度。400 帧消融在结构化路径上只保留近期帧时复现了原版的 11.74 厘米 ATE。分别加回固定帧、历史锚或摘要后，ATE 分别为 19.69、17.41 和 13.04 厘米。当前 `structured24` 用于研究实验，两个实测场景的轨迹精度均有退化。
 
+### 视觉历史门微调
+
+训练冻结 ABot 权重，只更新最后一层跨帧注意力中的六个系数。近期窗口提供注意力基准，固定帧、历史锚和摘要各自形成一项带权残差。训练复用实际的缓存与检索，用跨 1、8 和 16 帧的相对位姿监督编码后的当前预测。同一场景中的旧帧状态在反传时视为常量。
+
+训练清单为 JSON，`train` 数组中每个场景应提供 `scene`、RGB 图像目录 `rgb`、连续前缀长度 `frames`、含 `poses` 的 `reference` NPZ 和 `baseline` 轨迹 JSONL。文件路径以清单位置为根。基线需含最初 120 帧的原生 `raw` 位姿，供训练时拟合尺度。训练逐轮输出权重，独立验证场景用于选权重。
+
+```bash
+python -m stream_reconstruction.train_visual_gate train.json \
+  --checkpoint "$CHECKPOINT" --output runs/visual-gate --epochs 2
+python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" \
+  --output runs/visual-tuned --pose-mode baseline --visual-context structured24 \
+  --visual-gate-weights "$GATE_WEIGHTS" --profile
+```
+
+`GATE_WEIGHTS` 指向选中的轮次 JSON。`trajectory.jsonl` 中的 `visual_context.history_weights` 依次记录固定帧、历史锚和摘要的融合权重。`key_tokens` 在视觉门运行中对应单次注意力调用的最大键数。
+
+首轮实验在三个 ScanNet 场景训练两轮，以 `scene0097_00` 的 600 帧整段 ATE 选出第 2 轮。两条 1000 帧测试序列上，原始 12 帧、直接 24 位置、初始门和微调门的整段 ATE 在 `scene0140_00` 分别为 16.67、51.57、16.73、17.46 厘米，在 `scene0070_00` 分别为 26.69、97.58、26.78、22.27 厘米。微调门的 500 帧间隔旋转误差在两条序列均略高于原始 12 帧。
+
 ## 选帧规则
 
 1. 单次提取空间 patch token，做平均池化并进行 L2 归一化。每帧最多采集 192 个 ORB 特征，读取对应像素的预测局部三维点和置信度，将局部射线旋转到共同的世界坐标系。

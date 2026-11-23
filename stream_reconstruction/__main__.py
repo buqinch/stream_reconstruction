@@ -49,6 +49,8 @@ def main():
     parser.add_argument("--min-gap", type=int, default=1, help="两个已接纳锚之间的最小输入间隔")
     parser.add_argument("--visual-context", choices=("structured24", "local12"), default="structured24",
                         help="主干读取 12＋6＋3＋3 个视觉位置，或使用原始 12 帧对照")
+    parser.add_argument("--visual-gate-weights", type=Path,
+                        help="最后一层视觉注意力的历史融合门 JSON")
     parser.add_argument("--revise-depth", action="store_true", help="保存四步几何融合后的锚帧深度")
     parser.add_argument("--pose-mode", choices=("baseline", "anchors", "fixed"), default="baseline",
                         help="选择原始位姿、历史锚，或历史锚加起始三帧")
@@ -70,6 +72,16 @@ def main():
     parser.add_argument("--loop-salad-checkpoint", type=Path, help="官方回环所需的本地 SALAD 权重")
     parser.add_argument("--loop-dino-checkpoint", type=Path, help="官方回环所需的本地 DINO 权重")
     args = parser.parse_args()
+    if args.visual_gate_weights and args.visual_context != "structured24":
+        parser.error("视觉门权重需要 --visual-context structured24")
+    visual_gate = None
+    if args.visual_gate_weights:
+        from .visual_gate import VisualHistoryGate
+
+        try:
+            visual_gate = VisualHistoryGate.load(args.visual_gate_weights)
+        except (OSError, ValueError) as error:
+            parser.error(f"视觉门加载失败：{error}")
     config = SelectionConfig(lookahead=args.lookahead, capacity=args.capacity, min_gap=args.min_gap)
     if args.revise_depth and args.lookahead != 4:
         parser.error("四步深度融合需要 --lookahead 4")
@@ -102,6 +114,9 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     import torch
 
+    if visual_gate is not None:
+        visual_gate.to(next(wrapper.model.network.parameters()).device)
+
     maps = SubmapWriter(args.output / "submaps") if args.submaps else None
     raw_poses, publish_ms, step_ms = [], [], []
     peak_anchor_bytes = peak_summary_bytes = 0
@@ -113,7 +128,8 @@ def main():
                         pose_mode=args.pose_mode, pose_solver=args.pose_solver, summary=args.summary,
                         direction_gain=args.direction_gain, summary_alignment=args.summary_alignment,
                         ttt=args.ttt, profile=args.profile, gate_parameters=gate_parameters,
-                        training_evidence=training_evidence, visual_context=args.visual_context)
+                        training_evidence=training_evidence, visual_context=args.visual_context,
+                        visual_gate=visual_gate)
     with (closing(steps), log.open("x", encoding="utf-8") as stream,
           trajectory.open("x", encoding="utf-8") as poses):
         started = perf_counter()
