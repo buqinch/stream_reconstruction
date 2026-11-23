@@ -43,10 +43,12 @@ def motion_keyframes(paths, tracker, threshold=50):
 def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
                 pose_mode="baseline", pose_solver="single", summary="off",
                 direction_gain=1., summary_alignment="single", ttt="off", profile=False,
-                gate_parameters=None, training_evidence=None):
+                gate_parameters=None, training_evidence=None, visual_context="structured24"):
     """逐帧返回原模型预测及到期决定，首版预测由调用方按需消费。"""
     import torch
     from abot_recon.modeling.streaming.core.cache_utils import detach_carry
+
+    from .visual_context import RECENT, stream_network
 
     if revise_depth and config.lookahead != DELAY:
         raise ValueError("既有深度融合需要四个后续输入")
@@ -56,80 +58,78 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
                                     gate_parameters is not None or training_evidence is not None):
         raise ValueError("方向摘要需要固定帧和联合求解模式")
     device = next(network.parameters()).device
+    network, visual = stream_network(network, config, visual_context)
     selector = AnchorSelector(config)
     memory = None if pose_mode == "baseline" else PoseMemory(
-        pose_mode, config.capacity, network.local_window_frames, solver=pose_solver, summary=summary,
+        pose_mode, config.capacity, RECENT, solver=pose_solver, summary=summary,
         direction_gain=direction_gain, alignment=summary_alignment, ttt=ttt,
         gate_parameters=gate_parameters, training_evidence=training_evidence)
     detector = cv2.ORB_create(nfeatures=192)
     geometry = deque(maxlen=DELAY + 1)
-    carry = reference = camera_state = descriptor = None
+    carry = reference = camera_state = None
 
-    def pool(_module, _args, output):
-        nonlocal descriptor
-        tokens = output["x_norm_patchtokens"] if isinstance(output, dict) else output
-        if tokens.ndim != 3 or tokens.shape[0] != 1:
-            raise ValueError("选帧器需要单张图像的空间 patch token")
-        descriptor = tokens.detach().mean(dim=1, dtype=torch.float32)[0]
-
-    hook = network.encoder.register_forward_hook(pool)
-    try:
-        for index, path in enumerate(paths):
-            tensor, rgb = _input_image(path)
-            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-            descriptor = None
-            with torch.inference_mode(), torch.autocast(
-                device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
-            ):
-                dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    for index, path in enumerate(paths):
+        tensor, rgb = _input_image(path)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        with torch.inference_mode(), torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
+        ):
+            dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+            frame = tensor[None, None].to(device=device, dtype=dtype)
+            if visual is None:
                 prediction = network(
-                    tensor[None, None].to(device=device, dtype=dtype), causal_global_attn=True,
-                    long_sequence_parallel=True, streaming_inference=True,
-                    past_key_values=carry, ref_hidden=reference, camera_state=camera_state,
-                )
+                    frame, causal_global_attn=True, long_sequence_parallel=True,
+                    streaming_inference=True, past_key_values=carry,
+                    ref_hidden=reference, camera_state=camera_state)
                 carry = network._postprocess_stream_carry(
                     detach_carry(prediction.get("past_key_values")), spatial_hw=gray.shape)
-                reference = prediction.get("ref_hidden", reference)
-                camera_state = prediction["camera_state"]
-            if descriptor is None or prediction.get("conf") is None:
-                raise ValueError("需要提供编码器 patch token 和置信度的 ABot 模型")
-            points = prediction["local_points"][0, 0]
-            confidence = prediction["conf"][0, 0, :, :, 0]
-            pose = prediction["camera_poses"][0, 0].detach().float().cpu().numpy()
-            if points.shape != (*gray.shape, 3) or tuple(confidence.shape) != gray.shape:
-                raise ValueError("模型点图和置信度须与输入像素对齐")
+            else:
+                prediction = network._forward_frame_paged(
+                    frame, frame_idx=index, ref_hidden=reference, camera_state=camera_state)
+            reference = prediction.get("ref_hidden", reference)
+            camera_state = prediction["camera_state"]
+        descriptor = network.encoder.descriptor
+        if descriptor is None or prediction.get("conf") is None:
+            raise ValueError("需要提供编码器 patch token 和置信度的 ABot 模型")
+        points = prediction["local_points"][0, 0]
+        confidence = prediction["conf"][0, 0, :, :, 0]
+        pose = prediction["camera_poses"][0, 0].detach().float().cpu().numpy()
+        if points.shape != (*gray.shape, 3) or tuple(confidence.shape) != gray.shape:
+            raise ValueError("模型点图和置信度须与输入像素对齐")
 
-            def sample_geometry(y, x):
-                rows = torch.as_tensor(y, device=device)
-                cols = torch.as_tensor(x, device=device)
-                values = points[rows, cols].float().cpu().numpy()
-                weights = confidence[rows, cols].float().sigmoid().cpu().numpy()
-                return values, weights
+        def sample_geometry(y, x):
+            rows = torch.as_tensor(y, device=device)
+            cols = torch.as_tensor(x, device=device)
+            values = points[rows, cols].float().cpu().numpy()
+            weights = confidence[rows, cols].float().sigmoid().cpu().numpy()
+            return values, weights
 
-            observation = observe(
-                index, descriptor.cpu().numpy(), gray, pose, detector, sample_geometry,
-                config.min_confidence)
-            decision = selector.push(observation)
-            published, evidence = pose, {}
-            if memory is not None:
-                axes = ()
-                if summary != "off":
-                    grid = points[::8, ::8].float().cpu().numpy()
-                    scores = confidence[::8, ::8].float().sigmoid().cpu().numpy()
-                    axes = plane_axes(grid, scores, max(0.25, config.min_confidence))
-                published, evidence = memory.advance(observation, pose, decision, axes)
-                if profile:
-                    anchor_bytes, summary_bytes = memory.index_payload_bytes()
-                    evidence.update(anchor_index_bytes=anchor_bytes, summary_index_bytes=summary_bytes)
-            corrected = None
-            if revise_depth:
-                geometry.append(Frame(
-                    index, gray, points[::4, ::4].float().cpu().numpy(),
-                    confidence[::4, ::4].float().sigmoid().cpu().numpy(), pose))
-                if decision is not None and decision.kept:
-                    corrected, _ = revise(list(geometry))
-            yield StreamStep(index, prediction, decision, corrected, published, evidence)
-        for decision in selector.finish():
-            yield StreamStep(decision.decided_at, decision=decision)
-    finally:
-        hook.remove()
+        observation = observe(
+            index, descriptor.cpu().numpy(), gray, pose, detector, sample_geometry,
+            config.min_confidence)
+        decision = selector.push(observation)
+        published, evidence = pose, {}
+        if memory is not None:
+            axes = ()
+            if summary != "off":
+                grid = points[::8, ::8].float().cpu().numpy()
+                scores = confidence[::8, ::8].float().sigmoid().cpu().numpy()
+                axes = plane_axes(grid, scores, max(0.25, config.min_confidence))
+            published, evidence = memory.advance(observation, pose, decision, axes)
+            if profile:
+                anchor_bytes, summary_bytes = memory.index_payload_bytes()
+                evidence.update(anchor_index_bytes=anchor_bytes, summary_index_bytes=summary_bytes)
+        if visual is not None:
+            with torch.inference_mode():
+                visual.finish(decision)
+            evidence["visual_context"] = visual.trace
+        corrected = None
+        if revise_depth:
+            geometry.append(Frame(
+                index, gray, points[::4, ::4].float().cpu().numpy(),
+                confidence[::4, ::4].float().sigmoid().cpu().numpy(), pose))
+            if decision is not None and decision.kept:
+                corrected, _ = revise(list(geometry))
+        yield StreamStep(index, prediction, decision, corrected, published, evidence)
+    for decision in selector.finish():
+        yield StreamStep(decision.decided_at, decision=decision)

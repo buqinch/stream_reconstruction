@@ -11,7 +11,29 @@ python -m stream_reconstruction rgb.txt --checkpoint /path/to/abot_recon.safeten
 python -m unittest discover -s tests -v
 ```
 
-`decisions.jsonl` 中每个输入帧均有一条决定。项目也提供 `stream_reconstruction.abot.reconstruct(network, paths, config)`，每个输入步返回原模型的预测字典。流结束后还会发送尾帧的决定，此时 `prediction` 为空。每条流使用独立的模型编码器钩子，提前停止迭代时应关闭生成器。
+`decisions.jsonl` 中每个输入帧均有一条决定。Python 入口为 `stream_reconstruction.abot.reconstruct(network, paths, config)`。每条流独立保存视觉历史和选帧状态。流结束后还会发送尾帧的决定，此时 `prediction` 为空。
+
+## 主干的 24 个视觉位置
+
+默认 `--visual-context structured24`。每个跨帧注意力层用当前帧的 Query 读取以下视觉 K/V，然后才预测相机位姿、局部点图和置信度。每个位置都含一整帧的寄存器和空间 patch。每个输入步只编码一张新图。
+
+| 位置 | 当前第 `t` 帧能读取的内容（从 0 编号） |
+| --- | --- |
+| 12 个近期位置 | 当前帧及之前最多 11 帧。 |
+| 6 个历史锚位置 | 基于下文的共视和视差判据接纳帧。离开近窗且已确认后进入有界锚库，从库中按当前图像描述子的余弦相似度取前 6 张。 |
+| 3 个固定位置 | 帧 0、1、2 各自离开近窗后使用独立位置。固定帧与历史锚按帧号去重。 |
+| 3 个全历史摘要位置 | 所有离开近窗的帧各贡献一次。最早三帧各建一个簇，接着三帧按相似度为每簇再分配一个成员。随后按与簇平均描述子的余弦相似度归类。每簇逐层、逐 patch 以 FP32 更新 K/V 均值，再以推理精度提供给注意力。 |
+
+真实帧使用原始帧号的三维 RoPE。每个簇将键的时间通道转到首个成员的相位后求均值，空间编码沿用原 patch 网格。摘要按图像网格聚合，尚未做跨视角几何对齐。真实帧可以同时为聚合摘要贡献信息。若摘要只有一个成员且该帧已直接入窗，则跳过该摘要。短序列和锚帧不足时按实际可用数运行。
+
+`trajectory.jsonl` 的 `visual_context` 记录近期帧号、窗外锚、固定帧、摘要支持数与起止帧号。`positions` 为本步位置数，`key_tokens` 从传给注意力的实际键张量读取。发布配置在 504×280 分辨率下每个位置有 725 个 token，满额时每层实际读取 17,400 个。用同一输入、同一权重对照两种视觉窗口可执行以下命令。
+
+```bash
+python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" --output runs/local12 --visual-context local12 --pose-mode baseline --profile
+python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" --output runs/structured24 --visual-context structured24 --pose-mode baseline --profile
+```
+
+下文的历史实验数字均来自 `local12`。几何求解的 `--summary` 和 `--ttt` 仍由各自开关控制。本实现对接了上游单帧解码器的缓存接口，使用 PyTorch SDPA 执行注意力。[上游核对版本](https://github.com/amap-cvlab/ABot-Recon/tree/6e3b2e1257464a74dfceff22eb33190bd228276e)
 
 ## 选帧规则
 
@@ -40,7 +62,7 @@ indices = list(motion_keyframes(paths, FrameTracker()))
 
 | `--pose-mode` | 当前帧可读取的几何参考 |
 | --- | --- |
-| `baseline`（默认） | 原版冻结主干的近期窗口 |
+| `baseline`（默认） | 直接发布所选视觉窗口的主干预测 |
 | `anchors` | 额外从已提交锚中按余弦相似度检索最多 6 张窗外帧 |
 | `fixed` | 在历史锚之外保留最初 3 张真实帧，离开近期窗口后可用，按帧号去重 |
 
@@ -54,7 +76,7 @@ indices = list(motion_keyframes(paths, FrameTracker()))
 for variant in baseline:single anchors:single fixed:single anchors:joint fixed:joint; do
   mode=${variant%:*}
   solver=${variant#*:}
-  python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" \
+  python -m stream_reconstruction "$RGB" --visual-context local12 --checkpoint "$CHECKPOINT" \
     --pose-mode "$mode" --pose-solver "$solver" --output "runs/$mode-$solver" || break
 done
 ```
@@ -115,7 +137,7 @@ done
 `--direction-gain` 缩放联合求解中方向残差的能量，接受 0 至 1，默认 1。比较关闭摘要或启用弱方向约束时，可以使用下列命令中的相应参数。
 
 ```bash
-python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" \
+python -m stream_reconstruction "$RGB" --visual-context local12 --checkpoint "$CHECKPOINT" \
   --pose-mode fixed --pose-solver joint --summary full --direction-gain 0.1 \
   --output runs/full-light
 ```
@@ -139,7 +161,7 @@ python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" \
 当前特征继承已匹配参考特征的分组，冲突的轨迹退出全部分组。求解只读取历史锚和固定帧的求解组。两个近期帧可补充在线训练组与核验组的对应。每隔 8 帧，在具有足够内点、覆盖和可观测性的情况下，对一次高斯–牛顿更新求导。梯度只传给六个门参数。根据训练角残差提出权重候选，再用独立对应核验，接受后从下一帧开始使用。日志 `ttt` 记录两门权重、触发、接受和下一帧生效标记。
 
 ```bash
-python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" --output runs/online \
+python -m stream_reconstruction "$RGB" --visual-context local12 --checkpoint "$CHECKPOINT" --output runs/online \
   --pose-mode fixed --pose-solver joint --summary full --direction-gain 0.1 \
   --summary-alignment consensus --ttt online --profile --submaps
 ```
@@ -165,7 +187,7 @@ python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" --output runs/
 先为每个训练和验证场景采集一次。各场景使用独立的输出目录。
 
 ```bash
-python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" --output runs/scene-data \
+python -m stream_reconstruction "$RGB" --visual-context local12 --checkpoint "$CHECKPOINT" --output runs/scene-data \
   --pose-mode fixed --pose-solver joint --summary full --direction-gain 0.1 \
   --summary-alignment consensus --ttt fixed --capture-gates
 ```
@@ -186,7 +208,7 @@ python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" --output runs/
 
 ```bash
 OMP_NUM_THREADS=1 python -m stream_reconstruction.train_gates manifest.json --output runs/model
-python -m stream_reconstruction "$TEST_RGB" --checkpoint "$CHECKPOINT" --output runs/trained \
+python -m stream_reconstruction "$TEST_RGB" --visual-context local12 --checkpoint "$CHECKPOINT" --output runs/trained \
   --pose-mode fixed --pose-solver joint --summary full --direction-gain 0.1 \
   --summary-alignment consensus --ttt fixed --gate-weights runs/model/gates.json
 ```

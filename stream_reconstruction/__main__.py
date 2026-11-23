@@ -47,6 +47,8 @@ def main():
     parser.add_argument("--lookahead", type=int, default=4, help="选锚前观察的后续输入步数")
     parser.add_argument("--capacity", type=int, default=8, help="长期锚帧槽位数")
     parser.add_argument("--min-gap", type=int, default=1, help="两个已接纳锚之间的最小输入间隔")
+    parser.add_argument("--visual-context", choices=("structured24", "local12"), default="structured24",
+                        help="主干读取 12＋6＋3＋3 个视觉位置，或使用原始 12 帧对照")
     parser.add_argument("--revise-depth", action="store_true", help="保存四步几何融合后的锚帧深度")
     parser.add_argument("--pose-mode", choices=("baseline", "anchors", "fixed"), default="baseline",
                         help="选择原始位姿、历史锚，或历史锚加起始三帧")
@@ -96,7 +98,7 @@ def main():
 
     wrapper = ABotRecon.from_pretrained(
         str(args.checkpoint), local_files_only=True, device="cuda",
-        attention_backend="sdpa", loop_closure=False)
+        attention_backend="sdpa", loop_closure=False, max_frames=max(22_000, len(paths)))
     args.output.mkdir(parents=True, exist_ok=False)
     import torch
 
@@ -111,17 +113,21 @@ def main():
                         pose_mode=args.pose_mode, pose_solver=args.pose_solver, summary=args.summary,
                         direction_gain=args.direction_gain, summary_alignment=args.summary_alignment,
                         ttt=args.ttt, profile=args.profile, gate_parameters=gate_parameters,
-                        training_evidence=training_evidence)
+                        training_evidence=training_evidence, visual_context=args.visual_context)
     with (closing(steps), log.open("x", encoding="utf-8") as stream,
           trajectory.open("x", encoding="utf-8") as poses):
         started = perf_counter()
         accepted = 0
         for step in steps:
             if step.prediction is not None:
+                if args.profile:
+                    # 窗外摘要在 GPU 上异步更新，计时须包含本步提交的工作。
+                    torch.cuda.synchronize()
                 publish_ms.append((perf_counter() - started) * 1000)
                 raw = step.prediction["camera_poses"][0, 0].detach().float().cpu().tolist()
                 entry = dict(index=step.index, image=paths[step.index].name, raw=raw,
                              pose=step.published_pose.tolist(), mode=args.pose_mode,
+                             visual_mode=args.visual_context,
                              solver=args.pose_solver, summary=args.summary,
                              direction_gain=args.direction_gain, summary_alignment=args.summary_alignment,
                              **step.pose_evidence)
@@ -151,7 +157,8 @@ def main():
         maps.finish()
     if args.profile:
         write_manifest(args.output / "profile.json", dict(
-            frames=len(publish_ms), first_pose_p95_ms=float(np.percentile(publish_ms, 95)),
+            frames=len(publish_ms), visual_mode=args.visual_context,
+            first_pose_p95_ms=float(np.percentile(publish_ms, 95)),
             end_to_end_p95_ms=float(np.percentile(step_ms, 95)),
             peak_cuda_allocated_bytes=torch.cuda.max_memory_allocated(),
             peak_cuda_reserved_bytes=torch.cuda.max_memory_reserved(), accepted_ttt_updates=accepted,
