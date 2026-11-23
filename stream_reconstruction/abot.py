@@ -2,6 +2,7 @@
 
 from collections import deque
 from dataclasses import dataclass
+from time import perf_counter
 
 import cv2
 import numpy as np
@@ -45,7 +46,7 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
                 direction_gain=1., summary_alignment="single", ttt="off", profile=False,
                 gate_parameters=None, training_evidence=None, visual_context="structured24",
                 visual_gate=None, gradient_interval=0, visual_ttt=False,
-                prefix_fast_weights=False, history_fast_weights=False):
+                prefix_fast_weights=False, history_fast_weights=False, visual_replay=None):
     """逐帧返回原模型预测及到期决定，首版预测由调用方按需消费。"""
     import torch
     from abot_recon.modeling.streaming.core.cache_utils import detach_carry
@@ -78,7 +79,9 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
         gradient_interval = adaptation.interval
     network, visual = stream_network(network, config, visual_context, visual_gate,
                                      prefix_fast_weights=prefix_fast_weights,
-                                     history_fast_weights=history_fast_weights)
+                                     history_fast_weights=history_fast_weights, replay=visual_replay)
+    if visual is not None:
+        visual.profile = profile
     selector = AnchorSelector(config)
     memory = None if pose_mode == "baseline" else PoseMemory(
         pose_mode, config.capacity, RECENT, solver=pose_solver, summary=summary,
@@ -89,8 +92,12 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
     carry = reference = camera_state = None
 
     for index, path in enumerate(paths):
+        started = perf_counter() if profile else None
         tensor, rgb = _input_image(path)
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        if profile:
+            input_ms = (perf_counter() - started) * 1000
+            forward_start = perf_counter()
         gradient = index >= RECENT and index % gradient_interval == 0 if gradient_interval else False
         if adaptation is not None and gradient:
             initial_context = copy(visual)
@@ -119,6 +126,8 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
         points = prediction["local_points"][0, 0]
         confidence = prediction["conf"][0, 0, :, :, 0]
         pose = prediction["camera_poses"][0, 0].detach().float().cpu().numpy()
+        if profile:
+            forward_ms = (perf_counter() - forward_start) * 1000
         if points.shape != (*gray.shape, 3) or tuple(confidence.shape) != gray.shape:
             raise ValueError("模型点图和置信度须与输入像素对齐")
 
@@ -164,11 +173,30 @@ def reconstruct(network, paths, config=SelectionConfig(), *, revise_depth=False,
                         observation, pose, prediction["camera_poses"][0, 0].float(),
                         visual.trace["anchors"] + visual.trace["fixed"], replay)
                 evidence["visual_ttt"] = update
+            if profile and visual.use_summary:
+                write_started = perf_counter()
+                if device.type == "cuda":
+                    write_start = torch.cuda.Event(enable_timing=True)
+                    write_end = torch.cuda.Event(enable_timing=True)
+                    write_start.record()
             with torch.no_grad():
                 visual.finish(decision)
+            if profile and visual.use_summary and device.type == "cuda":
+                write_end.record()
+                write_end.synchronize()
+                summary_ms = write_start.elapsed_time(write_end)
+            elif profile and visual.use_summary:
+                summary_ms = (perf_counter() - write_started) * 1000
             if adaptation is not None:
                 adaptation.remember(observation, pose, visual)
             evidence["visual_context"] = visual.trace
+        if profile:
+            evidence["visual_profile"] = dict(
+                input_ms=input_ms, backbone_ms=forward_ms,
+                retrieval_ms=visual.retrieval_ms if visual is not None else 0.,
+                kv_pack_host_ms=visual.kv_pack_ms if visual is not None else None,
+                summary_ms=summary_ms if visual is not None and visual.use_summary else 0.,
+                cache_bytes=visual.cache_bytes() if visual is not None else None)
         corrected = None
         if revise_depth:
             geometry.append(Frame(

@@ -46,6 +46,22 @@ python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" --output runs/
 
 在同一帧与同一前缀状态下，分别移除固定帧、历史锚和视觉摘要，这三种操作都改变了正式权重输出的位姿、局部点图和置信度。400 帧消融在结构化路径上只保留近期帧时复现了原版的 11.74 厘米 ATE。分别加回固定帧、历史锚或摘要后，ATE 分别为 19.69、17.41 和 13.04 厘米。当前 `structured24` 用于研究实验，两个实测场景的轨迹精度均有退化。
 
+### 四锚与全历史摘要对照
+
+`anchors4` 让当前帧逐层读取近期 12 帧和实际选中的最多 4 张窗外锚。起始三帧和其余帧遵循同一选锚规则。`anchors4-summary` 进一步读取最多 3 个视觉摘要，由所有离开近期窗口的帧更新，同一帧写入一次。两种模式共用 ABot 原生位姿头和点图头。
+
+下面各组使用同一段 `RGB` 和同一发布权重。`matched-recent` 按四锚组每步实际读入的真实帧数取连续近期帧。`anchors4-summary` 可回放四锚组的接纳和选中记录，控制真实帧输入。去掉该组的 `--visual-replay` 即可独立在线选锚。
+
+```bash
+python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" --output runs/four-a --visual-context local12 --pose-mode baseline --profile
+python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" --output runs/four-c --visual-context anchors4 --pose-mode baseline --profile
+python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" --output runs/four-b --visual-context matched-recent --visual-replay runs/four-c --pose-mode baseline --profile
+python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" --output runs/four-d --visual-context anchors4-summary --visual-replay runs/four-c --pose-mode baseline --profile
+python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" --output runs/four-d-online --visual-context anchors4-summary --pose-mode baseline --profile
+```
+
+`--visual-replay` 读取已完成四锚组的 `trajectory.jsonl` 和 `decisions.jsonl`。新模式的 `visual_context` 还记录逐帧锚库和接纳、驱逐及摘要写入事件。`--profile` 输出 `timing.jsonl` 和 `profile.json`，记录逐帧耗时、整体吞吐量和 CUDA 峰值。
+
 ### 视觉历史门微调
 
 训练冻结 ABot 权重，只更新最后一层跨帧注意力中的六个系数。近期窗口提供注意力基准，固定帧、历史锚和摘要各自形成一项带权残差。训练复用实际的缓存与检索，用跨 1、8 和 16 帧的相对位姿监督编码后的当前预测。同一场景中的旧帧状态在反传时视为常量。

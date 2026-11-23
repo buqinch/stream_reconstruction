@@ -1,7 +1,7 @@
 """对有序的单目 RGB 图像运行流式重建和锚帧选择。"""
 
 import argparse
-from contextlib import closing
+from contextlib import closing, nullcontext
 from dataclasses import asdict
 import json
 import math
@@ -14,6 +14,8 @@ from .abot import reconstruct
 from .selection import SelectionConfig
 from .gate_data import GateEvidence, load_gate_weights
 from .submaps import SubmapWriter, apply_official_loop, write_manifest
+from .visual_context import VISUAL_MODES
+from .visual_replay import VisualReplay
 
 
 def input_paths(source):
@@ -47,8 +49,10 @@ def main():
     parser.add_argument("--lookahead", type=int, default=4, help="选锚前观察的后续输入步数")
     parser.add_argument("--capacity", type=int, default=8, help="长期锚帧槽位数")
     parser.add_argument("--min-gap", type=int, default=1, help="两个已接纳锚之间的最小输入间隔")
-    parser.add_argument("--visual-context", choices=("structured24", "local12"), default="structured24",
-                        help="主干读取 12＋6＋3＋3 个视觉位置，或使用原始 12 帧对照")
+    parser.add_argument("--visual-context", choices=VISUAL_MODES, default="structured24",
+                        help="主干的近期、历史锚和摘要读取方式")
+    parser.add_argument("--visual-replay", type=Path,
+                        help="四锚模式的完整输出目录，用于配平窗口或摘要回放")
     parser.add_argument("--visual-gate-weights", type=Path,
                         help="最后一层视觉注意力的历史融合门 JSON")
     adaptation = parser.add_mutually_exclusive_group()
@@ -79,6 +83,10 @@ def main():
     parser.add_argument("--loop-salad-checkpoint", type=Path, help="官方回环所需的本地 SALAD 权重")
     parser.add_argument("--loop-dino-checkpoint", type=Path, help="官方回环所需的本地 DINO 权重")
     args = parser.parse_args()
+    if args.visual_context == "matched-recent" and args.visual_replay is None:
+        parser.error("等帧数近期窗口需要 --visual-replay")
+    if args.visual_replay and args.visual_context not in ("matched-recent", "anchors4-summary"):
+        parser.error("锚回放适用于等帧数近期窗口或四锚加摘要")
     if args.visual_gate_weights and args.visual_context != "structured24":
         parser.error("视觉门权重需要 --visual-context structured24")
     if args.visual_ttt and not args.visual_gate_weights:
@@ -119,6 +127,12 @@ def main():
     if any(loop_paths) and not all(path is not None and path.is_file() for path in loop_paths):
         parser.error("回环需要同时提供有效的本地 SALAD 和 DINO 权重")
     paths = input_paths(args.source)
+    replay = None
+    if args.visual_replay:
+        try:
+            replay = VisualReplay.load(args.visual_replay, paths, args.lookahead)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            parser.error(f"锚回放加载失败：{error}")
     from abot_recon import ABotRecon
 
     wrapper = ABotRecon.from_pretrained(
@@ -139,6 +153,7 @@ def main():
         torch.cuda.reset_peak_memory_stats()
     log = args.output / "decisions.jsonl.part"
     trajectory = args.output / "trajectory.jsonl.part"
+    timing = args.output / "timing.jsonl.part"
     steps = reconstruct(wrapper.model.network.eval(), paths, config, revise_depth=args.revise_depth,
                         pose_mode=args.pose_mode, pose_solver=args.pose_solver, summary=args.summary,
                         direction_gain=args.direction_gain, summary_alignment=args.summary_alignment,
@@ -146,8 +161,9 @@ def main():
                         training_evidence=training_evidence, visual_context=args.visual_context,
                         visual_gate=visual_gate, visual_ttt=args.visual_ttt,
                         prefix_fast_weights=args.prefix_fast_weights,
-                        history_fast_weights=args.history_fast_weights)
-    with (closing(steps), log.open("x", encoding="utf-8") as stream,
+                        history_fast_weights=args.history_fast_weights, visual_replay=replay)
+    with (closing(steps), (timing.open("x", encoding="utf-8") if args.profile else nullcontext()) as times,
+          log.open("x", encoding="utf-8") as stream,
           trajectory.open("x", encoding="utf-8") as poses):
         started = perf_counter()
         accepted = 0
@@ -183,16 +199,23 @@ def main():
             ended = perf_counter()
             if step.prediction is not None:
                 step_ms.append((ended - started) * 1000)
+                if times is not None:
+                    row = dict(index=step.index, end_to_end_ms=step_ms[-1],
+                               **step.pose_evidence["visual_profile"])
+                    times.write(json.dumps(row, allow_nan=False) + "\n")
             started = ended
     if training_evidence is not None:
         training_evidence.save(args.output / "gate_evidence.npz", len(paths), args.direction_gain)
     trajectory.rename(args.output / "trajectory.jsonl")
     log.rename(args.output / "decisions.jsonl")
+    if args.profile:
+        timing.rename(args.output / "timing.jsonl")
     if maps is not None:
         maps.finish()
     if args.profile:
         write_manifest(args.output / "profile.json", dict(
             frames=len(publish_ms), visual_mode=args.visual_context,
+            frames_per_second=len(step_ms) * 1000 / sum(step_ms),
             first_pose_p95_ms=float(np.percentile(publish_ms, 95)),
             end_to_end_p95_ms=float(np.percentile(step_ms, 95)),
             peak_cuda_allocated_bytes=torch.cuda.max_memory_allocated(),

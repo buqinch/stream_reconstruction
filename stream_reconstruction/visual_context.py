@@ -3,6 +3,7 @@
 from collections import deque
 from copy import copy
 from dataclasses import dataclass
+from time import perf_counter
 
 import numpy as np
 import torch
@@ -13,6 +14,8 @@ RECENT = 12
 ANCHORS = 6
 FIXED = 3
 SUMMARIES = 3
+FOUR_ANCHORS = 4
+VISUAL_MODES = ("local12", "structured24", "anchors4", "matched-recent", "anchors4-summary")
 
 
 class FrameEncoder(torch.nn.Module):
@@ -37,9 +40,9 @@ class FrameEncoder(torch.nn.Module):
 
 
 def stream_network(network, config, mode, visual_gate=None, *,
-                   prefix_fast_weights=False, history_fast_weights=False):
-    if mode not in ("structured24", "local12"):
-        raise ValueError("视觉窗口须选择 structured24 或 local12")
+                   prefix_fast_weights=False, history_fast_weights=False, replay=None):
+    if mode not in VISUAL_MODES:
+        raise ValueError("不支持的视觉上下文模式")
     if network.local_window_frames != RECENT:
         raise ValueError("请从发布模型的 12 帧配置启动视觉窗口实验")
     context = None
@@ -47,11 +50,14 @@ def stream_network(network, config, mode, visual_gate=None, *,
         raise ValueError("视觉门需要 structured24 模式")
     if (prefix_fast_weights or history_fast_weights) and visual_gate is None:
         raise ValueError("快权重需要视觉门")
-    if mode == "structured24":
+    if ((mode == "matched-recent" and replay is None)
+            or (replay is not None and mode not in ("matched-recent", "anchors4-summary"))):
+        raise ValueError("等帧数近期窗口需要回放，四锚加摘要支持可选回放")
+    if mode != "local12":
         if network.global_pos_encoding != "rope3d" or network.use_global_points:
             raise ValueError("结构化窗口需要发布模型的三维 RoPE 和局部点图头")
         context = VisualContext(network.num_global_decoder_blocks, network.rope3d_embed,
-                                config, visual_gate=visual_gate,
+                                config, mode=mode, replay=replay, visual_gate=visual_gate,
                                 prefix_fast_weights=prefix_fast_weights,
                                 history_fast_weights=history_fast_weights)
     # 每条流有自己的编码器入口和缓存管理器。注册表浅拷贝，参数及预测头共享。
@@ -59,7 +65,7 @@ def stream_network(network, config, mode, visual_gate=None, *,
     runtime._modules = network._modules.copy()
     runtime.encoder = FrameEncoder(network.encoder, context)
     if context is not None:
-        runtime.local_window_frames = RECENT + ANCHORS + FIXED + SUMMARIES
+        runtime.local_window_frames = context.max_positions
         runtime._paged_manager = context
     return runtime, context
 
@@ -101,9 +107,16 @@ class VisualSummary:
 class VisualContext:
     """单条流的缓存管理器，接口对应上游 paged_stream_forward 的两个回调。"""
 
-    def __init__(self, layers, rope, config, *, visual_gate=None,
+    def __init__(self, layers, rope, config, *, mode="structured24", replay=None, visual_gate=None,
                  prefix_fast_weights=False, history_fast_weights=False):
         self.layers = layers
+        self.mode = mode
+        self.replay = replay
+        self.fixed_count = FIXED if mode == "structured24" else 0
+        self.anchor_count = ANCHORS if mode == "structured24" else FOUR_ANCHORS
+        self.use_summary = mode in ("structured24", "anchors4-summary")
+        self.max_positions = RECENT + self.anchor_count + self.fixed_count + SUMMARIES * self.use_summary
+        self.recent_capacity = RECENT - 1 + (FOUR_ANCHORS if mode == "matched-recent" else 0)
         self.visual_gate = visual_gate
         self.prefix = None
         self.history_fast = None
@@ -127,8 +140,10 @@ class VisualContext:
         self.current = None
         self.selected = []
         self.trace = {}
+        self.profile = False
 
     def begin(self, descriptor):
+        started = perf_counter()
         if self.current is not None:
             raise RuntimeError("上一帧尚未完成")
         index = self.next_index
@@ -139,9 +154,12 @@ class VisualContext:
             raise ValueError("视觉检索需要非零有限帧描述子")
         self.current = VisualFrame(index, descriptor / norm)
         self.written_layers = 0
-        anchors = sorted(self.anchors, key=lambda f: float(f.descriptor @ self.current.descriptor),
-                         reverse=True)[:ANCHORS]
-        explicit = [*self.fixed, *anchors, *self.recent]
+        self.kv_pack_ms = 0.
+        anchors = self.choose_anchors(index)
+        recent = list(self.recent)
+        if self.mode == "matched-recent":
+            recent = recent[-(RECENT - 1 + len(self.replay.anchors[index])):]
+        explicit = [*self.fixed, *anchors, *recent]
         real_ids = {f.index for f in explicit}
         # 单例摘要可能恰好就是某个固定帧或召回锚，此时只读一次。
         active = [(i, group) for i, group in enumerate(self.summaries)
@@ -153,11 +171,12 @@ class VisualContext:
             # 摘要的键已旋转到其首个成员的时间相位。
             self.history_fast_entries.extend(((1, slot, group.count), group.kv, group.first)
                                              for slot, group in active)
-        self.trace = dict(recent=[f.index for f in self.recent] + [index],
+        self.trace = dict(recent=[f.index for f in recent] + [index],
                           anchors=[f.index for f in anchors], fixed=[f.index for f in self.fixed],
                           summaries=[dict(slot=i, count=g.count, first=g.first, last=g.last)
                                      for i, g in active],
                           positions=len(self.selected) + 1)
+        self.trace["library"] = [f.index for f in self.anchors]
         if self.visual_gate is not None:
             self.history_groups = (
                 [f.kv for f in self.fixed], [f.kv for f in anchors], [g.kv for _, g in active])
@@ -168,6 +187,17 @@ class VisualContext:
                      for item in group), default=0.)
                 for group in descriptors
             ]
+        self.retrieval_ms = (perf_counter() - started) * 1000
+
+    def choose_anchors(self, index):
+        if self.replay is not None and self.mode == "anchors4-summary":
+            bank = {item.index: item for item in self.anchors}
+            try:
+                return [bank[frame] for frame in self.replay.anchors[index]]
+            except KeyError as error:
+                raise ValueError(f"第 {index} 帧的回放锚尚未进入当前锚库") from error
+        return sorted(self.anchors, key=lambda frame: float(frame.descriptor @ self.current.descriptor),
+                      reverse=True)[:self.anchor_count]
 
     def append_frame(self, layer_idx, keys, values):
         if self.current is None or layer_idx != self.written_layers or layer_idx >= self.layers:
@@ -225,12 +255,15 @@ class VisualContext:
                         self.trace["history_fast_weights_update"] = update
             return mixed
         if self.selected:
+            started = perf_counter() if self.profile else None
             current = torch.cat([kv[layer_idx] for kv in self.selected] + [current], dim=1)
+            if started is not None:
+                self.kv_pack_ms += (perf_counter() - started) * 1000
         if layer_idx == 0:
             self.trace.update(tokens_per_position=query.shape[0], key_tokens=current.shape[1])
         return self.attend(query, current)
 
-    def _archive(self, frame):
+    def _write_summary(self, frame):
         if len(self.summaries) < SUMMARIES:
             self.summaries.append(VisualSummary(frame))
         else:
@@ -244,27 +277,51 @@ class VisualContext:
             group = max(candidates, key=similarity)
             group.add(frame, self.rope)
 
-        if frame.index < FIXED:
+    def _admit_anchor(self, frame):
+        if len(self.anchors) == self.anchors.maxlen:
+            self.trace["anchor_evicted"] = self.anchors[0].index
+        self.anchors.append(frame)
+        self.trace["anchor_admitted"] = frame.index
+
+    def _archive(self, frame):
+        if self.use_summary:
+            self._write_summary(frame)
+            self.trace["summary_archive"] = frame.index
+        if frame.index < self.fixed_count:
             self.fixed.append(frame)
         elif frame.index in self.admitted:
             self.admitted.remove(frame.index)
-            self.anchors.append(frame)
+            self._admit_anchor(frame)
         elif frame.index + self.lookahead > self.current.index:
             self.pending[frame.index] = frame
 
     def finish(self, decision):
         if self.current is None or self.written_layers != self.layers:
             raise RuntimeError("视觉窗口只提交完成所有跨帧层的输入")
-        if decision is not None and decision.candidate >= FIXED:
+        if self.mode == "anchors4-summary" and self.replay is not None:
+            decision = self.replay.decisions.get(self.current.index)
+        if (self.mode != "matched-recent" and decision is not None
+                and decision.candidate >= self.fixed_count):
             pending = self.pending.pop(decision.candidate, None)
             if decision.kept:
+                self.trace["anchor_confirmed"] = decision.candidate
                 if pending is None:
                     self.admitted.add(decision.candidate)
                 else:
-                    self.anchors.append(pending)
+                    self._admit_anchor(pending)
         self.recent.append(self.current)
-        if len(self.recent) >= RECENT:
-            self._archive(self.recent.popleft())
+        if len(self.recent) > self.recent_capacity:
+            expired = self.recent.popleft()
+            if self.mode != "matched-recent":
+                self._archive(expired)
         self.current = None
         self.selected = []
         self.next_index += 1
+
+    def cache_bytes(self):
+        frames = (*self.recent, *self.fixed, *self.anchors, *self.pending.values())
+        frame_bytes = sum(frame.kv.nbytes for frame in frames)
+        descriptor_bytes = sum(frame.descriptor.nbytes for frame in frames)
+        descriptor_bytes += sum(group.center.nbytes for group in self.summaries)
+        summary_bytes = sum(group.mean.nbytes + group.kv.nbytes for group in self.summaries)
+        return dict(frame_kv=frame_bytes, summary_kv=summary_bytes, descriptor=descriptor_bytes)
