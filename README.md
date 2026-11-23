@@ -94,6 +94,20 @@ python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" \
 
 `trajectory.jsonl` 的 `prefix_calibration` 记录留出帧拟合结果，`prefix_fast_weights_applied` 标记使用快权重的帧。拟合和读取都用测试序列的视觉张量，无需外部相机位姿。
 
+### 历史位置快权重
+
+`--history-fast-weights` 使用当前选中的最多 6 个历史锚、3 个起始固定帧和 3 个视觉摘要槽作为快权重的写入源。选中集合或摘要版本变更时，取各位置最后一层的 K/V，每个位置最多取 96 个 token。按注意力头闭式求解线性 K→V 映射，正则以已有快权重为中心。真实帧以自身帧号去除时间 RoPE 相位，摘要使用首个成员的参考相位。
+
+每帧先使用已写入的快权重，再用当帧选中的历史位置更新。下一帧的 Q 读取更新后的权重，以 5% 比例融合到已有的视觉门输出。写入活动和读取帧分别由 `history_fast_weights_update` 和 `history_fast_weights_applied` 记录。
+
+```bash
+python -m stream_reconstruction "$RGB" --checkpoint "$CHECKPOINT" \
+  --output runs/visual-history --pose-mode baseline --visual-context structured24 \
+  --visual-gate-weights "$GATE_WEIGHTS" --history-fast-weights --profile
+```
+
+本次 ScanNet 两个 1000 帧对照中，固定视觉门、前缀快权重和历史位置快权重的 ATE 在 `scene0140_00` 分别为 16.76、19.70 和 28.38 厘米，在 `scene0070_00` 分别为 26.24、26.06 和 50.57 厘米。历史位置快权重的 500 帧间隔旋转误差在两个场景也高于固定视觉门。
+
 ## 选帧规则
 
 1. 单次提取空间 patch token，做平均池化并进行 L2 归一化。每帧最多采集 192 个 ORB 特征，读取对应像素的预测局部三维点和置信度，将局部射线旋转到共同的世界坐标系。

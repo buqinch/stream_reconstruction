@@ -1,4 +1,4 @@
-"""以开头十二帧的视觉键值对拟合会话级快权重。"""
+"""用视觉键值对拟合按头的线性快权重。"""
 
 import math
 
@@ -8,17 +8,13 @@ from torch.nn.functional import normalize
 from abot_recon.modeling.streaming.rope3d import apply_rotary_emb
 
 
-class PrefixFastWeights:
-    frames = 12
-    holdout = 2
+class LinearFastWeights:
     gain = .05
     ridge = .002
 
     def __init__(self, rope):
         self.rope = rope
-        self.samples = []
         self.weights = self.mean = None
-        self.calibration = None
 
     def features(self, tokens, index):
         # 去除绝对时间相位，让后续时刻仍可查询前缀，保留空间旋转。
@@ -28,19 +24,40 @@ class PrefixFastWeights:
         neutral = torch.cat((temporal, tokens[..., time_dim:].float()), dim=-1)
         return normalize(neutral.transpose(0, 1), dim=-1)
 
-    def fit(self, keys, values):
+    def fit(self, keys, values, prior=None):
         mean = values.mean(dim=1, keepdim=True)
         transpose = keys.transpose(-1, -2)
         identity = torch.eye(keys.shape[-1], device=keys.device)
-        covariance = transpose @ keys + self.ridge * keys.shape[1] * identity
-        weights = torch.linalg.solve(covariance, transpose @ (values - mean))
+        penalty = self.ridge * keys.shape[1]
+        covariance = transpose @ keys + penalty * identity
+        target = transpose @ (values - mean)
+        if prior is not None:
+            target = target + penalty * prior
+        weights = torch.linalg.solve(covariance, target)
         return weights, mean
 
-    def collect(self, cache, index):
+    def sample(self, cache, index):
         keys, values = cache.unbind(0)
         stride = max(1, (len(keys) + 95) // 96)
-        self.samples.append((self.features(keys[::stride], index),
-                             values[::stride].float().transpose(0, 1).contiguous()))
+        return (self.features(keys[::stride], index),
+                values[::stride].float().transpose(0, 1).contiguous())
+
+    def read(self, query, attended, index):
+        recovered = self.features(query, index) @ self.weights + self.mean
+        return torch.lerp(attended, recovered.transpose(0, 1).to(attended.dtype), self.gain)
+
+
+class PrefixFastWeights(LinearFastWeights):
+    frames = 12
+    holdout = 2
+
+    def __init__(self, rope):
+        super().__init__(rope)
+        self.samples = []
+        self.calibration = None
+
+    def collect(self, cache, index):
+        self.samples.append(self.sample(cache, index))
         if len(self.samples) == self.frames:
             self.calibrate()
 
@@ -63,6 +80,24 @@ class PrefixFastWeights:
                                 fitted_mse=fitted if math.isfinite(fitted) else None)
         self.samples.clear()
 
-    def read(self, query, attended, index):
-        recovered = self.features(query, index) @ self.weights + self.mean
-        return torch.lerp(attended, recovered.transpose(0, 1).to(attended.dtype), self.gain)
+
+class HistoricalFastWeights(LinearFastWeights):
+    def __init__(self, rope):
+        super().__init__(rope)
+        self.revision = None
+
+    def update(self, entries, layer):
+        """按现有快权重正则化本轮历史位置的键值拟合。"""
+        revision = tuple(sorted(key for key, _, _ in entries))
+        if not revision or revision == self.revision:
+            return None
+        samples = [self.sample(cache[layer], index) for _, cache, index in entries]
+        keys, values = (torch.cat(group, dim=1) for group in zip(*samples))
+        self.revision = revision
+        if not bool(torch.isfinite(keys).all() and torch.isfinite(values).all()):
+            return dict(accepted=False)
+        weights, mean = self.fit(keys, values, prior=self.weights)
+        accepted = bool(torch.isfinite(weights).all() and torch.isfinite(mean).all())
+        if accepted:
+            self.weights, self.mean = weights, mean
+        return dict(accepted=accepted, positions=len(entries), tokens=keys.shape[1])

@@ -56,6 +56,8 @@ def main():
                             help="用历史共视点在线微调视觉注意力门")
     adaptation.add_argument("--prefix-fast-weights", action="store_true",
                             help="用前 12 帧拟合会话快权重，从第 13 帧使用")
+    adaptation.add_argument("--history-fast-weights", action="store_true",
+                            help="用选中的窗外帧和摘要在线更新快权重")
     parser.add_argument("--revise-depth", action="store_true", help="保存四步几何融合后的锚帧深度")
     parser.add_argument("--pose-mode", choices=("baseline", "anchors", "fixed"), default="baseline",
                         help="选择原始位姿、历史锚，或历史锚加起始三帧")
@@ -83,6 +85,8 @@ def main():
         parser.error("视觉 TTT 需要 --visual-gate-weights 初始化")
     if args.prefix_fast_weights and not args.visual_gate_weights:
         parser.error("前缀快权重需要 --visual-gate-weights")
+    if args.history_fast_weights and not args.visual_gate_weights:
+        parser.error("历史快权重需要 --visual-gate-weights")
     visual_gate = None
     if args.visual_gate_weights:
         from .visual_gate import VisualHistoryGate
@@ -141,7 +145,8 @@ def main():
                         ttt=args.ttt, profile=args.profile, gate_parameters=gate_parameters,
                         training_evidence=training_evidence, visual_context=args.visual_context,
                         visual_gate=visual_gate, visual_ttt=args.visual_ttt,
-                        prefix_fast_weights=args.prefix_fast_weights)
+                        prefix_fast_weights=args.prefix_fast_weights,
+                        history_fast_weights=args.history_fast_weights)
     with (closing(steps), log.open("x", encoding="utf-8") as stream,
           trajectory.open("x", encoding="utf-8") as poses):
         started = perf_counter()

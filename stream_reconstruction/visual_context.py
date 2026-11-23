@@ -36,7 +36,8 @@ class FrameEncoder(torch.nn.Module):
         return output
 
 
-def stream_network(network, config, mode, visual_gate=None, *, prefix_fast_weights=False):
+def stream_network(network, config, mode, visual_gate=None, *,
+                   prefix_fast_weights=False, history_fast_weights=False):
     if mode not in ("structured24", "local12"):
         raise ValueError("视觉窗口须选择 structured24 或 local12")
     if network.local_window_frames != RECENT:
@@ -44,14 +45,15 @@ def stream_network(network, config, mode, visual_gate=None, *, prefix_fast_weigh
     context = None
     if visual_gate is not None and mode != "structured24":
         raise ValueError("视觉门需要 structured24 模式")
-    if prefix_fast_weights and visual_gate is None:
-        raise ValueError("前缀快权重需要视觉门")
+    if (prefix_fast_weights or history_fast_weights) and visual_gate is None:
+        raise ValueError("快权重需要视觉门")
     if mode == "structured24":
         if network.global_pos_encoding != "rope3d" or network.use_global_points:
             raise ValueError("结构化窗口需要发布模型的三维 RoPE 和局部点图头")
         context = VisualContext(network.num_global_decoder_blocks, network.rope3d_embed,
                                 config, visual_gate=visual_gate,
-                                prefix_fast_weights=prefix_fast_weights)
+                                prefix_fast_weights=prefix_fast_weights,
+                                history_fast_weights=history_fast_weights)
     # 每条流有自己的编码器入口和缓存管理器。注册表浅拷贝，参数及预测头共享。
     runtime = copy(network)
     runtime._modules = network._modules.copy()
@@ -99,14 +101,20 @@ class VisualSummary:
 class VisualContext:
     """单条流的缓存管理器，接口对应上游 paged_stream_forward 的两个回调。"""
 
-    def __init__(self, layers, rope, config, *, visual_gate=None, prefix_fast_weights=False):
+    def __init__(self, layers, rope, config, *, visual_gate=None,
+                 prefix_fast_weights=False, history_fast_weights=False):
         self.layers = layers
         self.visual_gate = visual_gate
         self.prefix = None
+        self.history_fast = None
         if prefix_fast_weights:
             from .prefix_fast_weights import PrefixFastWeights
 
             self.prefix = PrefixFastWeights(rope)
+        if history_fast_weights:
+            from .prefix_fast_weights import HistoricalFastWeights
+
+            self.history_fast = HistoricalFastWeights(rope)
         self.rope = rope
         self.lookahead = config.lookahead
         self.recent = deque()
@@ -139,6 +147,12 @@ class VisualContext:
         active = [(i, group) for i, group in enumerate(self.summaries)
                   if group.count > 1 or group.first not in real_ids]
         self.selected = [f.kv for f in explicit] + [g.kv for _, g in active]
+        if self.history_fast is not None:
+            self.history_fast_entries = [((0, f.index, 0), f.kv, f.index)
+                                         for f in (*self.fixed, *anchors)]
+            # 摘要的键已旋转到其首个成员的时间相位。
+            self.history_fast_entries.extend(((1, slot, group.count), group.kv, group.first)
+                                             for slot, group in active)
         self.trace = dict(recent=[f.index for f in self.recent] + [index],
                           anchors=[f.index for f in anchors], fixed=[f.index for f in self.fixed],
                           summaries=[dict(slot=i, count=g.count, first=g.first, last=g.last)
@@ -201,6 +215,14 @@ class VisualContext:
                     elif self.prefix.weights is not None:
                         mixed = self.prefix.read(query, mixed, self.current.index)
                         self.trace["prefix_fast_weights_applied"] = True
+            if self.history_fast is not None:
+                with torch.autocast(device_type=query.device.type, enabled=False):
+                    if self.history_fast.weights is not None:
+                        mixed = self.history_fast.read(query, mixed, self.current.index)
+                        self.trace["history_fast_weights_applied"] = True
+                    update = self.history_fast.update(self.history_fast_entries, layer_idx)
+                    if update is not None:
+                        self.trace["history_fast_weights_update"] = update
             return mixed
         if self.selected:
             current = torch.cat([kv[layer_idx] for kv in self.selected] + [current], dim=1)
